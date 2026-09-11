@@ -34,6 +34,10 @@ pip install -r requirements.txt
 cp .env.example .env
 # edit .env: add your ANTHROPIC_API_KEY (only needed for premium-tier calls)
 
+# IMPORTANT: browser automation requires the browser binary to be installed once after pip install.
+# `pip install -r requirements.txt` installs the Python package only; it does NOT download Chromium.
+playwright install chromium
+
 # optional, for the free local tier:
 # install Ollama from https://ollama.com, then:
 ollama pull llama3.1
@@ -43,6 +47,27 @@ Run the chat loop:
 
 ```bash
 python -m src.cli
+```
+
+## Web UI
+
+Run the NiceGUI app from the project folder:
+
+```bash
+python -m src.web_ui
+```
+
+The app calls `ui.run()` itself, so no Streamlit wrapper is needed. It opens a
+browser tab automatically by default and runs at [http://localhost:8080](http://localhost:8080).
+If port `8080` is already occupied, the app automatically selects the next available
+port and prints the actual URL in the terminal.
+For development auto-reload, use `ui.run(reload=True)`; otherwise keep
+`reload=False`.
+
+Stop it with:
+
+```powershell
+Ctrl+C
 ```
 
 Force a tier for a single message:
@@ -189,4 +214,18 @@ You do not need to edit `cli.py` for this. The model can decide to use these too
 - `Create a calendar event for tomorrow at 3pm for a project review.`
 - `Send an email to alice@example.com with the subject 'Project update' and a short summary body.`
 
-The write tools (`gmail_send_email`, `calendar_create_event`) require an explicit confirmation callback from the app layer before actually sending or creating anything, matching the project-wide `confirm_fn` pattern used by `ShellTool`.
+## Browser automation setup
+
+After `pip install -r requirements.txt`, you must also run this once in the project environment:
+
+```bash
+playwright install chromium
+```
+
+This is required because the `playwright` Python package installs the automation API, but the actual Chromium binary is downloaded separately. If you skip this step, the browser tools will fail at runtime when they try to launch the browser.
+
+The browser instance stays open for the lifetime of the running process (CLI session, Streamlit app, or scheduler run) instead of closing after each tool call. That keeps page state available between browser actions and avoids the overhead of relaunching a browser for every single request.
+
+## Optional system automation
+
+This project can also opt into an optional `plugins/system_monitor/plugin.py` toolset for local system health and process inspection. It exposes `system_stats`, `list_processes`, and `kill_process` tools. The destructive `kill_process` tool is gated behind the same explicit confirm callback pattern as the shell tool, so it will not terminate anything without user approval.

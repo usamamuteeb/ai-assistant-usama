@@ -1,0 +1,34 @@
+        <title><![CDATA[BBC News]]></title>
+            <title>BBC News</title>
+            <title><![CDATA[Spies, strategies and missed opportunities: How the lessons of 9/11 are still being learnt]]></title>
+            <title><![CDATA[AI boom helps drive surprise UK growth in July]]></title>
+            <title><![CDATA[Anthropic blocks possible attempt to use AI to make biological weapons]]></title>
+            <title><![CDATA[Princess Diana's 'revenge dress' goes up for auction]]></title>
+            <title><![CDATA[New hurricane season record as 'historic' El Niño leaves Atlantic eerily quiet]]></title>
+            <title><![CDATA[As Trump dominates convention, some Republicans quietly ask who comes next]]></title>
+            <title><![CDATA[Civilians told to flee Ukraine's fortress cities as Russia bids to control Donbas]]></title>
+            <title><![CDATA[Five dead and dozens injured in coach crash in Swiss Alps]]></title>
+            <title><![CDATA[Polanski selected as Green Party candidate for Starmer's former seat]]></title>
+            <title><![CDATA[I watched as a hijacked plane flew over my home - moments later my wife was killed]]></title>
+            <title><![CDATA[Brother of Muslim policeman killed in attacks 'disappointed' by calls for Mamdani to sit out memorial]]></title>
+            <title><![CDATA[My experience of tragedy gave me a second family]]></title>
+            <title><![CDATA[I was in the epicentre - I'm so lucky to have lived]]></title>
+            <title><![CDATA[I was weeks from marrying a violent serial rapist - my loved ones saved my life]]></title>
+            <title><![CDATA[Henry Zeffman: How Burnham got ready to govern with four key moments mapped out]]></title>
+            <title><![CDATA[People long for simpler times, say Practical Magic reboot stars]]></title>
+            <title><![CDATA[I asked my husband to pay into my pension when we had a child - here's why]]></title>
+            <title><![CDATA['Do I have to turn this gig down?': Female DJs describe harassment behind the decks]]></title>
+            <title><![CDATA[Weekly quiz: Alan Carr collected a prize for which TV show at the NTAs?]]></title>
+            <title><![CDATA['Like a hangover': Why your partner's snoring could be impacting your health]]></title>
+            <title><![CDATA[Philippine rescuers board ferry 40 hours after blaze began ]]></title>
+            <title><![CDATA[Man loses case to claw back $369,000 he spent on lavish gifts for ex-girlfriend]]></title>
+            <title><![CDATA[Son charged with murdering parents appears in court]]></title>
+            <title><![CDATA[Rayner defends pause to local council overhaul]]></title>
+            <title><![CDATA[Hong Kong's Tiananmen activists sentenced to up to seven years in prison]]></title>
+            <title><![CDATA[BBC News app]]></title>
+            <title><![CDATA[Americast]]></title>
+            <title><![CDATA[Trump's $5,000 Payout Promise]]></title>
+            <title><![CDATA[Hall signs new contract with Newcastle until 2031]]></title>
+            <title><![CDATA[$10m on line at inaugural Ultimate Championship]]></title>
+            <title><![CDATA[Bed at 6:45am - US Open semi-finalists fight effects of late-night finishes]]></title>
+            <title><![CDATA[Hull's Thomas unhurt after car crash]]></title>

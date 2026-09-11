@@ -135,7 +135,7 @@ class GroqBackend:
                         for b in content
                         if b.get("type") == "tool_use"
                     ]
-                    msg: dict[str, Any] = {"role": "assistant", "content": text or None}
+                    msg: dict[str, Any] = {"role": "assistant", "content": text or ""}
                     if tool_calls:
                         msg["tool_calls"] = tool_calls
                     openai_messages.append(msg)
@@ -163,14 +163,46 @@ class GroqBackend:
         if tools:
             payload["tools"] = _anthropic_tools_to_ollama(tools)  # same shape OpenAI expects
 
-        resp = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=payload,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        # Retry logic for rate limits (429) with exponential backoff or Retry-After header
+        max_retries = 3
+        backoff_base = 2
+
+        for attempt in range(max_retries):
+            resp = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json=payload,
+                timeout=60,
+            )
+
+            if resp.status_code == 429:
+                # Rate limited; try to sleep before retrying
+                if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            sleep_time = float(retry_after)
+                        except ValueError:
+                            # If Retry-After is not a number, use exponential backoff
+                            sleep_time = backoff_base ** (attempt + 1)
+                    else:
+                        sleep_time = backoff_base ** (attempt + 1)
+                    time.sleep(sleep_time)
+                continue
+
+            # Check for other HTTP errors (4xx, 5xx)
+            if not (200 <= resp.status_code < 300):
+                resp.raise_for_status()
+
+            # Success; we can proceed
+            data = resp.json()
+            break
+        else:
+            # Loop completed without break means all retries exhausted on 429
+            raise RuntimeError(
+                "Groq API rate limit (HTTP 429) hit after 3 retries. "
+                "Check your usage at https://console.groq.com/account/limits."
+            )
 
         choice = data["choices"][0]
         message = choice["message"]

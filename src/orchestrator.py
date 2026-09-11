@@ -21,7 +21,14 @@ action or information you don't already have. Be direct and concise. When you're
 whether to act or ask, ask.
 """
 
-MAX_TOOL_ITERATIONS = 6
+MAX_TOOL_ITERATIONS = 10
+
+
+def _summarize_tool_result(value: Any, limit: int = 300) -> str:
+    text = str(value)
+    if text.lower().strip().startswith("{\"error\"") or "error" in text.lower() and "confirmation denied" not in text.lower():
+        return ""
+    return text[:limit].rstrip() + ("..." if len(text) > limit else "")
 
 
 class Orchestrator:
@@ -83,15 +90,70 @@ class Orchestrator:
             messages.append({"role": "assistant", "content": assistant_content})
 
             tool_result_blocks = []
+            confirmation_denied_action = None
             for tc in result.tool_calls:
                 output = self.tools.call(tc.name, **tc.input)
+                output_str = str(output)
+                if len(output_str) > 4000:
+                    output_str = output_str[:4000] + "... [truncated]"
                 tool_result_blocks.append(
                     {
                         "type": "tool_result",
                         "tool_use_id": tc.id,
-                        "content": str(output),
+                        "content": output_str,
                     }
                 )
+
+                # Check if this tool call was denied due to confirmation
+                if "confirmation denied or not provided" in output_str:
+                    confirmation_denied_action = (tc.name, tc.input)
+
+            # If any tool call was denied due to confirmation, stop and ask for approval
+            if confirmation_denied_action:
+                tool_name, tool_input = confirmation_denied_action
+                action_desc = self._describe_tool_action(tool_name, tool_input)
+                return f"Waiting for your approval on: {action_desc}. Approve or deny it to continue."
+
             messages.append({"role": "user", "content": tool_result_blocks})
 
+        partial_results: list[str] = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                text = str(block.get("content", ""))
+                if not text:
+                    continue
+                lower = text.lower()
+                if "error" in lower and "confirmation denied" not in lower:
+                    continue
+                summary = _summarize_tool_result(text, 300)
+                if summary:
+                    partial_results.append(summary)
+
+        if partial_results:
+            summary_block = ["Partial results before stopping:"] + [f"- {entry}" for entry in partial_results[:5]]
+            return "\n".join(summary_block) + "\nStopped after reaching the tool-call iteration limit — task may be incomplete."
+
         return "Stopped after reaching the tool-call iteration limit — task may be incomplete."
+
+    def _describe_tool_action(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        """Extract a human-readable description of a tool action from its name and input."""
+        if tool_name == "run_shell_command":
+            return f"the shell command: `{tool_input.get('command', 'unknown')}`"
+        elif tool_name == "send_email":
+            to = tool_input.get("to", "unknown")
+            subject = tool_input.get("subject", "")
+            return f"sending email to {to} with subject '{subject}'"
+        elif tool_name == "create_event":
+            title = tool_input.get("title", "unknown")
+            return f"creating calendar event: {title}"
+        elif tool_name == "terminate_process":
+            pid = tool_input.get("pid", "unknown")
+            return f"terminating process {pid}"
+        else:
+            # Generic fallback
+            return f"the {tool_name} action"

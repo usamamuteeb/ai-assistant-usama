@@ -44,6 +44,9 @@ shell_tool:
   require_confirmation: true          # ask before executing shell commands from the CLI
   timeout_seconds: 30
 
+browser:
+  headless: true                       # run browser automation in headless mode by default; set to false only for interactive debugging
+
 google_workspace:
   credentials_path: credentials.json   # downloaded from Google Cloud Console project root
   scopes:
