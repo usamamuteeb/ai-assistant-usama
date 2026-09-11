@@ -212,7 +212,15 @@ class BrowserScreenshotTool(Tool):
             page.screenshot(path=str(screenshot_path), full_page=True)
 
             relative_path = screenshot_path.relative_to(self.config.root)
-            return {"path": str(relative_path).replace("\\", "/")}
+            # The NiceGUI app serves this directory at /browser-screenshots.
+            # Keep the filesystem path for non-web callers, but return a
+            # browser-safe URL too so an assistant response can embed it.
+            screenshot_url = f"/browser-screenshots/{screenshot_path.name}"
+            return {
+                "path": str(relative_path).replace("\\", "/"),
+                "url": screenshot_url,
+                "markdown": f"![Browser screenshot]({screenshot_url})",
+            }
         except Exception as exc:  # pragma: no cover - runtime browser/platform dependency path
             return {"error": f"Browser action failed: {exc}"}
 

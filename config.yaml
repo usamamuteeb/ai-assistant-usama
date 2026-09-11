@@ -13,9 +13,13 @@ models:
     max_tokens: 2048
   free_api:
     provider: groq
-    model: openai/gpt-oss-20b   # updated to a model available to the current GROQ_API_KEY
     base_url: https://api.groq.com/openai/v1
     max_tokens: 2048
+    chain:
+      - openai/gpt-oss-120b
+      - openai/gpt-oss-20b
+      - llama-3.3-70b-versatile
+      - llama-3.1-8b-instant
 
 routing:
   # Heuristic knobs used by ModelRouter.pick_tier() in src/model_router.py
@@ -45,7 +49,14 @@ shell_tool:
   timeout_seconds: 30
 
 browser:
-  headless: true                       # run browser automation in headless mode by default; set to false only for interactive debugging
+  # Keep browser actions visible on the desktop. Set this to true only when you
+  # explicitly want unattended, invisible browser automation.
+  headless: false
+
+windows_control:
+  # Keep desktop-affecting actions behind the browser confirmation dialog even
+  # when the global approval mode is set to auto.
+  force_manual_confirmation: true
 
 google_workspace:
   credentials_path: credentials.json   # downloaded from Google Cloud Console project root

@@ -43,7 +43,13 @@ class Settings:
 
     @property
     def free_api_model(self) -> dict[str, Any]:
-        return self.raw["models"]["free_api"]
+        cfg = dict(self.raw["models"]["free_api"])
+        chain = cfg.get("chain")
+        if chain is None and cfg.get("model"):
+            # Preserve compatibility with existing single-model configurations.
+            chain = [cfg["model"]]
+        cfg["chain"] = [str(model) for model in chain or [] if str(model).strip()]
+        return cfg
 
     @property
     def routing(self) -> dict[str, Any]:

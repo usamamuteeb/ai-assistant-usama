@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import platform
+import re
 import socket
 import sys
 import threading
@@ -22,22 +25,98 @@ from src.orchestrator import Orchestrator
 
 TIER_OPTIONS = ["auto", "local", "premium", "free_api"]
 APPROVAL_MODES = ["manual", "auto"]
+PAGE_TITLE = "Personal AI Assistant"
+REQUEST_UI_TIMEOUT_SECONDS = 90
+logger = logging.getLogger(__name__)
 _pending_confirmations: dict[str, dict[str, Any]] = {}
 _pending_lock = threading.Lock()
 _session_confirm_fns: dict[str, Any] = {}
 _approval_modes: dict[str, str] = {}
 _last_confirmation_results: dict[str, bool] = {}
 _active_session_id: str | None = None
-_orchestrator_lock = asyncio.Lock()
+_active_request_task: asyncio.Task[str] | None = None
+
+# Browser screenshots are saved by the browser plugin under the workspace. Make
+# them available to this local UI without exposing the rest of the workspace.
+_ui_settings = load_settings()
+_browser_screenshots_dir = _ui_settings.workspace_root() / "screenshots"
+_browser_screenshots_dir.mkdir(parents=True, exist_ok=True)
+app.add_static_files("/browser-screenshots", _browser_screenshots_dir)
+_LEGACY_SCREENSHOT_MARKDOWN = re.compile(
+    r"(!\[[^\]]*\]\()\s*(?:\./)?workspace/screenshots/([^\s)]+)(\))"
+)
 
 
-def _confirm_for_session(session_id: str, command: str) -> bool:
-    if _approval_modes.get(session_id, "auto") == "auto":
+def _surface_confirmation_notification() -> None:
+    """Best-effort cue for a browser-hosted approval request on Windows."""
+    if platform.system() != "Windows":
+        return
+
+    try:
+        import win32api
+        import win32con
+        import win32gui
+        import win32process
+
+        candidates: list[int] = []
+
+        def collect_window(handle: int, _extra: Any) -> bool:
+            if win32gui.IsWindowVisible(handle) and PAGE_TITLE.casefold() in win32gui.GetWindowText(handle).casefold():
+                candidates.append(handle)
+            return True
+
+        win32gui.EnumWindows(collect_window, None)
+        if not candidates:
+            raise RuntimeError(f"No visible browser window title contains '{PAGE_TITLE}'.")
+        target = candidates[0]
+        foreground = win32gui.GetForegroundWindow()
+        current_thread = win32api.GetCurrentThreadId()
+        foreground_thread, _ = win32process.GetWindowThreadProcessId(foreground)
+        target_thread, _ = win32process.GetWindowThreadProcessId(target)
+        attached_foreground = attached_target = False
+        try:
+            if foreground_thread and foreground_thread != current_thread:
+                win32process.AttachThreadInput(current_thread, foreground_thread, True)
+                attached_foreground = True
+            if target_thread and target_thread != current_thread:
+                win32process.AttachThreadInput(current_thread, target_thread, True)
+                attached_target = True
+
+            win32gui.ShowWindow(target, win32con.SW_RESTORE)
+            win32gui.BringWindowToTop(target)
+            # A brief topmost raise is a fallback for Windows focus-stealing
+            # prevention. It is immediately reverted and never left topmost.
+            position_flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW
+            win32gui.SetWindowPos(target, win32con.HWND_TOPMOST, 0, 0, 0, 0, position_flags)
+            win32gui.SetWindowPos(target, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, position_flags)
+            win32gui.SetForegroundWindow(target)
+            if win32gui.GetForegroundWindow() != target:
+                raise RuntimeError("Windows focus-stealing protection rejected the foreground request.")
+        finally:
+            if attached_target:
+                win32process.AttachThreadInput(current_thread, target_thread, False)
+            if attached_foreground:
+                win32process.AttachThreadInput(current_thread, foreground_thread, False)
+    except Exception as exc:
+        # Windows can reject focus stealing; never let that block the worker.
+        logger.warning("Could not bring the approval browser window to the foreground: %s", exc)
+
+    try:
+        import winsound
+
+        winsound.Beep(880, 180)
+    except Exception as exc:
+        logger.warning("Could not play the approval notification beep: %s", exc)
+
+
+def _confirm_for_session(session_id: str, command: str, *, force_manual: bool = False) -> bool:
+    if not force_manual and _approval_modes.get(session_id, "auto") == "auto":
         return True
     event = threading.Event()
     pending = {"command": command, "event": event, "result": None, "shown": False}
     with _pending_lock:
         _pending_confirmations[session_id] = pending
+    _surface_confirmation_notification()
     event.wait()
     with _pending_lock:
         result = _pending_confirmations.get(session_id, pending).get("result")
@@ -60,12 +139,44 @@ def _dispatch_confirm(command: str) -> bool:
     return _session_confirm_fns[session_id](command)
 
 
+def _dispatch_manual_confirm(command: str) -> bool:
+    """Always use the browser dialog, even while global approval mode is auto."""
+    session_id = _active_session_id
+    if session_id is None:
+        return False
+    return _confirm_for_session(session_id, command, force_manual=True)
+
+
+# Plugins which opt into a force-manual policy use this explicit, fail-closed
+# path rather than inferring manual mode from the global approval toggle.
+_dispatch_confirm.manual_confirm = _dispatch_manual_confirm
+
+
 # Keep one long-lived orchestrator for its SQLite/vector/tool resources.
-orchestrator = Orchestrator(load_settings(), confirm_fn=_dispatch_confirm)
+orchestrator = Orchestrator(_ui_settings, confirm_fn=_dispatch_confirm)
 
 
 def _force_tier(selection: str) -> str | None:
     return None if selection == "auto" else selection
+
+
+def _chat_markdown(content: str) -> str:
+    """Map legacy browser-screenshot paths to the local static-file route."""
+    return _LEGACY_SCREENSHOT_MARKDOWN.sub(r"\1/browser-screenshots/\2\3", content)
+
+
+def _clear_finished_request(task: asyncio.Task[str]) -> None:
+    """Release the global request slot after a delayed worker finally exits."""
+    global _active_request_task, _active_session_id
+    try:
+        error = task.exception()
+        if error is not None:
+            logger.warning("Assistant request ended after the UI stopped waiting: %s", error)
+    except asyncio.CancelledError:
+        pass
+    if _active_request_task is task:
+        _active_request_task = None
+        _active_session_id = None
 
 
 def _available_port(start: int = 8080) -> int:
@@ -101,7 +212,7 @@ def _render_history(chat_log: ui.column, history: list[dict[str, str]]) -> None:
                 name="You" if sent else "Assistant",
                 sent=sent,
             ).classes(f"assistant-message {message_class}"):
-                ui.markdown(entry["content"]).classes("chat-markdown")
+                ui.markdown(_chat_markdown(entry["content"])).classes("chat-markdown")
 
 
 def _show_confirmation(session_id: str, dialog_holder: dict[str, Any]) -> None:
@@ -145,7 +256,7 @@ def main() -> None:
 
     ui.dark_mode().enable()
     ui.colors(primary="#d1202c", secondary="#7f1d1d")
-    ui.page_title("Personal AI Assistant")
+    ui.page_title(PAGE_TITLE)
     ui.add_css("""
         :root { color-scheme: dark; --ink: #f8fafc; --muted: #a8afb9; --panel: #1a1b1e; --panel-2: #222326; --line: rgba(255,255,255,.08); --crimson: #d1202c; }
         body, .q-page, .q-page-container, .q-layout { background: radial-gradient(circle at 78% -18%, rgba(120, 18, 28, .23), transparent 30rem), #111214; color: var(--ink); }
@@ -261,8 +372,12 @@ def main() -> None:
     sending = {"active": False}
 
     async def send_message() -> None:
+        global _active_request_task, _active_session_id
         user_message = message_input.value.strip()
         if not user_message or sending["active"]:
+            return
+        if _active_request_task is not None and not _active_request_task.done():
+            ui.notify("The previous request is still running. Please wait before sending another message.", type="warning")
             return
         sending["active"] = True
         message_input.value = ""
@@ -270,23 +385,29 @@ def main() -> None:
         history.append({"role": "user", "content": user_message})
         _render_history(chat_log, history)
         try:
-            global _active_session_id
-            async with _orchestrator_lock:
-                _active_session_id = session_id
-                try:
-                    reply = await run.io_bound(
-                        orchestrator.handle_message,
-                        session_id,
-                        user_message,
-                        force_tier=_force_tier(client["selected_tier"]),
-                    )
-                    if (
-                        not _last_confirmation_results.get(session_id, True)
-                        and reply.startswith("Waiting for your approval on:")
-                    ):
-                        reply = "Command denied by user."
-                finally:
-                    _active_session_id = None
+            _active_session_id = session_id
+            task = asyncio.create_task(
+                run.io_bound(
+                    orchestrator.handle_message,
+                    session_id,
+                    user_message,
+                    force_tier=_force_tier(client["selected_tier"]),
+                )
+            )
+            _active_request_task = task
+            task.add_done_callback(_clear_finished_request)
+            try:
+                reply = await asyncio.wait_for(asyncio.shield(task), timeout=REQUEST_UI_TIMEOUT_SECONDS)
+            except TimeoutError:
+                reply = (
+                    "[error] This request is taking longer than 90 seconds and is still running. "
+                    "The input is available again, but new requests are held until this one finishes; do not retry it yet."
+                )
+            if (
+                not _last_confirmation_results.get(session_id, True)
+                and reply.startswith("Waiting for your approval on:")
+            ):
+                reply = "Command denied by user."
         except Exception as exc:
             traceback.print_exc()
             reply = f"[error] {exc}"
@@ -313,7 +434,7 @@ def main() -> None:
 
 if __name__ in {"__main__", "__mp_main__"}:
     ui.run(
-        title="Personal AI Assistant",
+        title=PAGE_TITLE,
         port=_available_port(),
         storage_secret="personal-ai-assistant",
         reload=False,

@@ -31,6 +31,7 @@ class ChatResult:
     tool_calls: list[ToolCall] = field(default_factory=list)
     stop_reason: str | None = None
     raw: Any = None
+    model_used: str | None = None
 
 
 class AnthropicBackend:
@@ -104,7 +105,9 @@ class GroqBackend:
             )
         self.api_key = settings.groq_api_key
         cfg = settings.free_api_model
-        self.model = cfg["model"]
+        self.chain = list(cfg.get("chain", []))
+        if not self.chain:
+            raise RuntimeError("Groq model chain is empty. Add models.free_api.chain to config.yaml.")
         self.max_tokens = cfg.get("max_tokens", 2048)
         self.base_url = cfg.get("base_url", "https://api.groq.com/openai/v1")
 
@@ -113,6 +116,7 @@ class GroqBackend:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> ChatResult:
         openai_messages = []
         if system:
@@ -156,7 +160,6 @@ class GroqBackend:
                 openai_messages.append({"role": m["role"], "content": content})
 
         payload: dict[str, Any] = {
-            "model": self.model,
             "messages": openai_messages,
             "max_tokens": self.max_tokens,
         }
@@ -164,66 +167,81 @@ class GroqBackend:
             payload["tools"] = _anthropic_tools_to_ollama(tools)  # same shape OpenAI expects
 
         # Retry logic for rate limits (429) with exponential backoff or Retry-After header
-        max_retries = 3
+        max_retries = 2
         backoff_base = 2
+        max_backoff_seconds = 4
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
-        for attempt in range(max_retries):
-            resp = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json=payload,
-                timeout=60,
-            )
-
-            if resp.status_code == 429:
-                # Rate limited; try to sleep before retrying
-                if attempt < max_retries - 1:  # Don't sleep on the last attempt
-                    retry_after = resp.headers.get("Retry-After")
-                    if retry_after:
-                        try:
-                            sleep_time = float(retry_after)
-                        except ValueError:
-                            # If Retry-After is not a number, use exponential backoff
-                            sleep_time = backoff_base ** (attempt + 1)
-                    else:
-                        sleep_time = backoff_base ** (attempt + 1)
-                    time.sleep(sleep_time)
-                continue
-
-            # Check for other HTTP errors (4xx, 5xx)
-            if not (200 <= resp.status_code < 300):
-                resp.raise_for_status()
-
-            # Success; we can proceed
-            data = resp.json()
-            break
-        else:
-            # Loop completed without break means all retries exhausted on 429
-            raise RuntimeError(
-                "Groq API rate limit (HTTP 429) hit after 3 retries. "
-                "Check your usage at https://console.groq.com/account/limits."
-            )
-
-        choice = data["choices"][0]
-        message = choice["message"]
-        text = message.get("content") or ""
-
-        tool_calls = []
-        for tc in message.get("tool_calls", []) or []:
-            fn = tc.get("function", {})
-            args = fn.get("arguments", {})
-            if isinstance(args, str):
+        models_tried: list[str] = []
+        for model_index, model in enumerate(self.chain):
+            models_tried.append(model)
+            payload["model"] = model
+            for attempt in range(max_retries):
+                request_timeout = 60.0
+                if deadline is not None:
+                    request_timeout = deadline - time.monotonic()
+                    if request_timeout <= 0:
+                        raise TimeoutError("Groq request exceeded the tool-loop time budget.")
                 try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {}
-            tool_calls.append(ToolCall(id=tc["id"], name=fn.get("name", ""), input=args))
+                    resp = requests.post(
+                        f"{self.base_url}/chat/completions",
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        json=payload,
+                        timeout=min(60.0, request_timeout),
+                    )
+                except requests.Timeout as exc:
+                    raise TimeoutError("Groq request exceeded the tool-loop time budget.") from exc
 
-        return ChatResult(
-            text=text.strip(),
-            tool_calls=tool_calls,
-            stop_reason=choice.get("finish_reason"),
-            raw=data,
+                if resp.status_code == 429:
+                    if attempt < max_retries - 1:
+                        retry_after = resp.headers.get("Retry-After")
+                        try:
+                            sleep_time = float(retry_after) if retry_after else backoff_base ** (attempt + 1)
+                        except ValueError:
+                            sleep_time = backoff_base ** (attempt + 1)
+                        sleep_time = min(sleep_time, max_backoff_seconds)
+                        if deadline is not None:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError("Groq retry exceeded the tool-loop time budget.")
+                            sleep_time = min(sleep_time, remaining)
+                        time.sleep(sleep_time)
+                    continue
+
+                if not (200 <= resp.status_code < 300):
+                    resp.raise_for_status()
+
+                data = resp.json()
+                choice = data["choices"][0]
+                message = choice["message"]
+                text = message.get("content") or ""
+
+                tool_calls = []
+                for tc in message.get("tool_calls", []) or []:
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            args = {}
+                    tool_calls.append(ToolCall(id=tc["id"], name=fn.get("name", ""), input=args))
+
+                return ChatResult(
+                    text=text.strip(),
+                    tool_calls=tool_calls,
+                    stop_reason=choice.get("finish_reason"),
+                    raw=data,
+                    model_used=model,
+                )
+
+            if model_index < len(self.chain) - 1:
+                print(f"{model} exhausted (429), falling back to {self.chain[model_index + 1]}")
+
+        raise RuntimeError(
+            "Groq free-tier daily limit exhausted for all configured models: "
+            f"{', '.join(models_tried)}. Wait for the limit to reset or temporarily set "
+            "routing.default_tier to 'premium' in config.yaml."
         )
 
 
@@ -367,6 +385,9 @@ class ModelRouter:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> ChatResult:
         backend = self.backend_for(tier)
+        if tier == "free_api":
+            return backend.chat(messages, tools=tools, system=system, timeout_seconds=timeout_seconds)
         return backend.chat(messages, tools=tools, system=system)

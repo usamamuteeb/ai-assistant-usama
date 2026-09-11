@@ -70,6 +70,26 @@ Stop it with:
 Ctrl+C
 ```
 
+## Windows desktop control setup
+
+On Windows, the `windows_control` plugin can inspect visible windows and read their
+controls. It can also open applications, click controls, close windows, and type
+on your actual desktop. Those action tools are powerful: a click or keystroke can
+affect whatever is open on the machine.
+
+`config.yaml` sets `windows_control.force_manual_confirmation: true` by default.
+It keeps two high-risk actions behind a real approval prompt even when the global
+UI approval mode is `auto`: `close_window`, because it can discard unsaved work,
+and `send_keystrokes_fallback`, because it types into an unverified currently
+focused window. `open_application` and `click_window_control` follow the global
+approval mode normally. Keep the override enabled unless you have a carefully
+controlled environment.
+
+The `send_keystrokes_fallback` tool uses PyAutoGUI only as a fallback and targets
+whichever window is currently focused. PyAutoGUI's failsafe remains enabled:
+drag the mouse pointer to any screen corner to abort an in-progress fallback
+action immediately.
+
 Force a tier for a single message:
 
 ```bash
@@ -224,7 +244,9 @@ playwright install chromium
 
 This is required because the `playwright` Python package installs the automation API, but the actual Chromium binary is downloaded separately. If you skip this step, the browser tools will fail at runtime when they try to launch the browser.
 
-The browser instance stays open for the lifetime of the running process (CLI session, Streamlit app, or scheduler run) instead of closing after each tool call. That keeps page state available between browser actions and avoids the overhead of relaunching a browser for every single request.
+The browser instance stays open for the lifetime of the running process (CLI session, NiceGUI app, or scheduler run) instead of closing after each tool call. That keeps page state available between browser actions and avoids the overhead of relaunching a browser for every single request.
+
+Browser actions are visible on the desktop by default (`browser.headless: false` in `config.yaml`), so you can inspect a page while the assistant works. Set it to `true` only for intentionally unattended automation. Browser screenshots are also displayed directly in the local chat UI; no external upload is involved.
 
 ## Optional system automation
 

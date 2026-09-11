@@ -6,6 +6,7 @@ elsewhere.
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Optional
 
 from .config import Settings
@@ -19,9 +20,14 @@ You have tools to read/write files in a sandboxed workspace, run shell commands 
 user's confirmation), and search long-term memory. Use tools when a task requires real
 action or information you don't already have. Be direct and concise. When you're not sure
 whether to act or ask, ask.
+If asked what you can do, what features or tools you have, or similar meta-questions about
+your own capabilities, answer directly from your knowledge of the tools available in this
+conversation. Do not call tools to answer capability questions. Only call tools when the
+user is asking you to actually do or look up something.
 """
 
 MAX_TOOL_ITERATIONS = 10
+MAX_TOOL_LOOP_SECONDS = 45
 
 
 def _summarize_tool_result(value: Any, limit: int = 300) -> str:
@@ -73,8 +79,25 @@ class Orchestrator:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> str:
+        start = time.monotonic()
         for _ in range(MAX_TOOL_ITERATIONS):
-            result: ChatResult = self.router.chat(tier, messages, tools=tools, system=SYSTEM_PROMPT)
+            elapsed = time.monotonic() - start
+            if elapsed > MAX_TOOL_LOOP_SECONDS:
+                return self._stopped_tool_loop_response(messages, elapsed_seconds=elapsed)
+
+            try:
+                result: ChatResult = self.router.chat(
+                    tier,
+                    messages,
+                    tools=tools,
+                    system=SYSTEM_PROMPT,
+                    timeout_seconds=MAX_TOOL_LOOP_SECONDS - elapsed,
+                )
+            except TimeoutError:
+                return self._stopped_tool_loop_response(
+                    messages,
+                    elapsed_seconds=time.monotonic() - start,
+                )
 
             if not result.tool_calls:
                 return result.text or "(no response)"
@@ -116,6 +139,13 @@ class Orchestrator:
 
             messages.append({"role": "user", "content": tool_result_blocks})
 
+        return self._stopped_tool_loop_response(messages)
+
+    @staticmethod
+    def _stopped_tool_loop_response(
+        messages: list[dict[str, Any]],
+        elapsed_seconds: float | None = None,
+    ) -> str:
         partial_results: list[str] = []
         for message in messages:
             content = message.get("content")
@@ -134,11 +164,17 @@ class Orchestrator:
                 if summary:
                     partial_results.append(summary)
 
-        if partial_results:
-            summary_block = ["Partial results before stopping:"] + [f"- {entry}" for entry in partial_results[:5]]
-            return "\n".join(summary_block) + "\nStopped after reaching the tool-call iteration limit — task may be incomplete."
+        if elapsed_seconds is not None:
+            stop_message = f"Stopped after {elapsed_seconds:.0f}s to avoid a long hang"
+        else:
+            stop_message = "Stopped after reaching the tool-call iteration limit"
 
-        return "Stopped after reaching the tool-call iteration limit — task may be incomplete."
+        if partial_results:
+            summary_block = [f"{stop_message} — here's what was gathered so far:"]
+            summary_block.extend(f"- {entry}" for entry in partial_results[:5])
+            return "\n".join(summary_block) + "\nTask may be incomplete."
+
+        return f"{stop_message} — task may be incomplete."
 
     def _describe_tool_action(self, tool_name: str, tool_input: dict[str, Any]) -> str:
         """Extract a human-readable description of a tool action from its name and input."""
