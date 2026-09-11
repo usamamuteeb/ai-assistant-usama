@@ -1,0 +1,61 @@
+# Personal AI Assistant — configuration
+# Edit this file directly; it's loaded fresh on every run (no rebuild needed).
+
+models:
+  premium:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    max_tokens: 2048
+  local:
+    provider: ollama
+    model: llama3.1
+    host: http://localhost:11434
+    max_tokens: 2048
+  free_api:
+    provider: groq
+    model: openai/gpt-oss-20b   # updated to a model available to the current GROQ_API_KEY
+    base_url: https://api.groq.com/openai/v1
+    max_tokens: 2048
+
+routing:
+  # Heuristic knobs used by ModelRouter.pick_tier() in src/model_router.py
+  premium_keywords:
+    - plan
+    - analyze
+    - refactor
+    - "write code"
+    - architecture
+    - debug
+    - research
+    - summarize a document
+  long_message_char_threshold: 400   # messages longer than this lean premium
+  default_tier: free_api              # fallback when heuristic is unsure (no cost, no local server needed)
+
+memory:
+  sqlite_path: data/sqlite.db
+  chroma_path: data/chroma
+  chroma_collection: assistant_memory
+  max_history_messages: 20            # how many past turns to load into context
+
+filesystem_tool:
+  workspace_root: workspace           # all file tool I/O is sandboxed here (created if missing)
+
+shell_tool:
+  require_confirmation: true          # ask before executing shell commands from the CLI
+  timeout_seconds: 30
+
+google_workspace:
+  credentials_path: credentials.json   # downloaded from Google Cloud Console project root
+  scopes:
+    - gmail.readonly
+    - gmail.send
+    - calendar
+
+scheduled_tasks:
+  # Example only — edit or remove. Each entry fires the orchestrator headlessly on a cron schedule.
+  # cron fields: minute hour day month day_of_week (standard cron syntax)
+  - name: daily_summary_example
+    cron: "0 8 * * *"
+    prompt: "Summarize anything new in the workspace folder and note it in memory."
+    tier: local
+    enabled: false
