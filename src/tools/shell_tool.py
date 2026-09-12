@@ -6,6 +6,9 @@ always returns True) only for commands you already trust.
 """
 from __future__ import annotations
 
+import os
+import platform
+import signal
 import subprocess
 from typing import Any, Callable, Optional
 
@@ -41,18 +44,42 @@ class ShellTool(Tool):
         if self.require_confirmation and not self.confirm_fn(command):
             return {"error": "Command not executed: confirmation denied or not provided."}
 
+        is_windows = platform.system() == "Windows"
+        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if is_windows else 0
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=creation_flags,
+            start_new_session=not is_windows,
+        )
         try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-            )
-            return {
-                "exit_code": result.returncode,
-                "stdout": result.stdout[-4000:],
-                "stderr": result.stderr[-4000:],
-            }
+            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
         except subprocess.TimeoutExpired:
-            return {"error": f"Command timed out after {self.timeout_seconds}s."}
+            if is_windows:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.kill()
+            process.communicate()
+            return {
+                "error": (
+                    f"Command timed out after {self.timeout_seconds}s and was forcibly "
+                    "terminated (including any child processes)."
+                )
+            }
+        return {
+            "exit_code": process.returncode,
+            "stdout": stdout[-4000:],
+            "stderr": stderr[-4000:],
+        }

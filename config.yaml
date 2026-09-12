@@ -18,6 +18,12 @@ models:
     max_tokens: 2048
     chain:
       - provider: gemini
+        model: gemini-3.5-flash-lite
+      - provider: gemini
+        model: gemini-2.5-flash-lite
+      - provider: gemini
+        model: gemini-3.1-flash-lite
+      - provider: gemini
         model: gemini-3.6-flash
       - provider: groq
         model: openai/gpt-oss-120b
@@ -43,6 +49,14 @@ routing:
   default_tier: free_api              # fallback when heuristic is unsure (no cost, no local server needed)
   allow_premium: false
 
+tool_relevance_filter:
+  enabled: true
+  max_tools: 10
+  min_tools: 6
+  core_tools:
+    - filesystem
+    - search_memory
+
 memory:
   sqlite_path: data/sqlite.db
   chroma_path: data/chroma
@@ -54,7 +68,7 @@ filesystem_tool:
 
 shell_tool:
   require_confirmation: true          # ask before executing shell commands from the CLI
-  timeout_seconds: 30
+  timeout_seconds: 120
 
 browser:
   # Keep browser actions visible on the desktop. Set this to true only when you

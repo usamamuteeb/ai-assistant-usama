@@ -6,6 +6,7 @@ elsewhere.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import time
 from typing import Any, Optional
@@ -14,6 +15,7 @@ from .config import Settings
 from .memory.store import SqliteStore
 from .memory.vector_store import VectorMemory
 from .model_router import ChatResult, ModelRouter
+from .tools.relevance import log_selection, select_relevant_tools
 from .tools.registry import ToolRegistry, build_registry
 
 SYSTEM_PROMPT = """You are a personal AI assistant running locally on the user's machine.
@@ -32,6 +34,7 @@ the user did not request — if something is ambiguous, ask the user instead of 
 
 MAX_TOOL_ITERATIONS = 10
 MAX_TOOL_LOOP_SECONDS = 45
+TOOL_CALL_HARD_TIMEOUT_SECONDS = 150
 
 
 def _summarize_tool_result(value: Any, limit: int = 300) -> str:
@@ -50,6 +53,7 @@ class Orchestrator:
             settings.chroma_path(), settings.memory.get("chroma_collection", "assistant_memory")
         )
         self.tools: ToolRegistry = build_registry(settings, self.vector_memory, confirm_fn=confirm_fn)
+        self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self._last_model_used: dict[str, str] = {}
         tool_schemas = self.tools.anthropic_tools()
         schema_tokens = sum(len(json.dumps(schema)) for schema in tool_schemas) // 4
@@ -79,6 +83,7 @@ class Orchestrator:
             tier,
             messages,
             anthropic_tools,
+            relevance_context=user_message,
             force_chain_start_index=force_chain_start_index,
         )
         self._last_model_used[session_id] = final_result.model_used or "unknown"
@@ -100,11 +105,14 @@ class Orchestrator:
         tier: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        relevance_context: str = "",
         force_chain_start_index: int | None = None,
     ) -> ChatResult:
         start = time.monotonic()
         executed_results: dict[tuple[str, Any], str] = {}
+        called_tool_names: set[str] = set()
         last_model_used: str | None = None
+        relevance_cfg = self.settings.tool_relevance_filter
         for _ in range(MAX_TOOL_ITERATIONS):
             elapsed = time.monotonic() - start
             if elapsed > MAX_TOOL_LOOP_SECONDS:
@@ -113,11 +121,23 @@ class Orchestrator:
                     model_used=last_model_used,
                 )
 
+            if relevance_cfg["enabled"]:
+                selected_tools = select_relevant_tools(
+                    relevance_context,
+                    tools,
+                    relevance_cfg["max_tools"],
+                    relevance_cfg["min_tools"],
+                    relevance_cfg["core_tools"] | called_tool_names,
+                )
+                log_selection(relevance_context, tools, selected_tools)
+            else:
+                selected_tools = tools
+
             try:
                 result: ChatResult = self.router.chat(
                     tier,
                     messages,
-                    tools=tools,
+                    tools=selected_tools,
                     system=SYSTEM_PROMPT,
                     timeout_seconds=MAX_TOOL_LOOP_SECONDS - elapsed,
                     force_chain_start_index=force_chain_start_index,
@@ -162,11 +182,23 @@ class Orchestrator:
                 if cache_key in executed_results:
                     output_str = executed_results[cache_key]
                 else:
-                    output = self.tools.call(tc.name, **tc.input)
+                    future = self._tool_executor.submit(self.tools.call, tc.name, **tc.input)
+                    try:
+                        output = future.result(timeout=TOOL_CALL_HARD_TIMEOUT_SECONDS)
+                    except concurrent.futures.TimeoutError:
+                        output = {
+                            "error": (
+                                f"Tool '{tc.name}' did not respond within "
+                                f"{TOOL_CALL_HARD_TIMEOUT_SECONDS}s and was abandoned. "
+                                "It may still be running in the background."
+                            )
+                        }
                     output_str = str(output)
                     executed_results[cache_key] = output_str
                 if len(output_str) > 4000:
                     output_str = output_str[:4000] + "... [truncated]"
+                called_tool_names.add(tc.name)
+                relevance_context += f"\nTool {tc.name} result: {output_str[:300]}"
                 tool_result_blocks.append(
                     {
                         "type": "tool_result",

@@ -81,6 +81,26 @@ you prefer higher accuracy over speed. Voice input requires microphone permissio
 in the browser. Enable **Read replies aloud** in the sidebar to use the system's
 default audio output for assistant replies.
 
+## Image generation
+
+The `generate_image` plugin uses Gemini's `gemini-3.1-flash-image` model to turn a
+text prompt into an image saved under `workspace/generated_images/`. Image generation
+depends on the model being enabled for your Google Cloud project and Gemini API key.
+If the first request returns an access or quota error, check the model access for your
+key at [Google AI Studio](https://aistudio.google.com/) before assuming the code is broken.
+
+## Screen reading (OCR) setup
+
+Screen reading uses Tesseract OCR to capture and read visible text. Download and
+install Tesseract OCR for Windows from the UB-Mannheim build at
+https://github.com/UB-Mannheim/tesseract/wiki. If Tesseract is not on PATH after
+installation, set `pytesseract.pytesseract.tesseract_cmd` to the installed
+`tesseract.exe` path; this is the most common setup failure with pytesseract on
+Windows.
+
+Captures and reads text from whatever is currently visible on the ENTIRE screen,
+not a specific app — the extracted text is sent to whichever model answers this request.
+
 ## Windows desktop control setup
 
 On Windows, the `windows_control` plugin can inspect visible windows and read their

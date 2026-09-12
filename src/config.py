@@ -95,6 +95,15 @@ class Settings:
         return self.raw["shell_tool"]
 
     @property
+    def tool_relevance_filter(self) -> dict[str, Any]:
+        cfg = dict(self.raw.get("tool_relevance_filter", {}))
+        cfg["enabled"] = bool(cfg.get("enabled", False))
+        cfg["max_tools"] = int(cfg.get("max_tools", 10))
+        cfg["min_tools"] = int(cfg.get("min_tools", 6))
+        cfg["core_tools"] = {str(name) for name in cfg.get("core_tools", [])}
+        return cfg
+
+    @property
     def scheduled_tasks(self) -> list[dict[str, Any]]:
         return self.raw.get("scheduled_tasks", [])
 
