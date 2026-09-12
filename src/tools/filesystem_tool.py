@@ -10,11 +10,7 @@ from .base import Tool
 
 class FilesystemTool(Tool):
     name = "filesystem"
-    description = (
-        "Read, write, or list files inside the local workspace folder. "
-        "action must be one of: 'read', 'write', 'list', 'delete'. "
-        "Paths are relative to the workspace root — you cannot access anything outside it."
-    )
+    description = "Read, write, list, or delete files inside the workspace using paths relative to its root."
     input_schema = {
         "type": "object",
         "properties": {

@@ -16,12 +16,7 @@ from src.tools.base import Tool
 
 class WebSearchStubTool(Tool):
     name = "web_search_stub"
-    description = (
-        "Placeholder for a real web search tool. Replace the implementation in "
-        "plugins/example_web_search/plugin.py with a real API call (e.g. Brave "
-        "Search API, SerpAPI, or your own scraper) — the model will start using "
-        "it immediately once it returns real results."
-    )
+    description = "Placeholder web search tool returning a stub result until a real search API is connected."
     input_schema = {
         "type": "object",
         "properties": {"query": {"type": "string"}},

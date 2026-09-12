@@ -11,15 +11,22 @@ models:
     model: llama3.1
     host: http://localhost:11434
     max_tokens: 2048
-  free_api:
+  groq:
     provider: groq
     base_url: https://api.groq.com/openai/v1
+  free_api:
     max_tokens: 2048
     chain:
-      - openai/gpt-oss-120b
-      - openai/gpt-oss-20b
-      - llama-3.3-70b-versatile
-      - llama-3.1-8b-instant
+      - provider: gemini
+        model: gemini-3.6-flash
+      - provider: groq
+        model: openai/gpt-oss-120b
+      - provider: groq
+        model: openai/gpt-oss-20b
+      - provider: groq
+        model: llama-3.3-70b-versatile
+      - provider: groq
+        model: llama-3.1-8b-instant
 
 routing:
   # Heuristic knobs used by ModelRouter.pick_tier() in src/model_router.py
@@ -34,12 +41,13 @@ routing:
     - summarize a document
   long_message_char_threshold: 400   # messages longer than this lean premium
   default_tier: free_api              # fallback when heuristic is unsure (no cost, no local server needed)
+  allow_premium: false
 
 memory:
   sqlite_path: data/sqlite.db
   chroma_path: data/chroma
   chroma_collection: assistant_memory
-  max_history_messages: 20            # how many past turns to load into context
+  max_history_messages: 12            # how many past turns to load; tune this if 12 feels too short
 
 filesystem_tool:
   workspace_root: workspace           # all file tool I/O is sandboxed here (created if missing)

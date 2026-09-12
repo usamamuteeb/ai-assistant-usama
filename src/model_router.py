@@ -105,11 +105,10 @@ class GroqBackend:
             )
         self.api_key = settings.groq_api_key
         cfg = settings.free_api_model
-        self.chain = list(cfg.get("chain", []))
-        if not self.chain:
-            raise RuntimeError("Groq model chain is empty. Add models.free_api.chain to config.yaml.")
         self.max_tokens = cfg.get("max_tokens", 2048)
-        self.base_url = cfg.get("base_url", "https://api.groq.com/openai/v1")
+        self.base_url = settings.raw.get("models", {}).get("groq", {}).get(
+            "base_url", "https://api.groq.com/openai/v1"
+        )
 
     def chat(
         self,
@@ -117,6 +116,7 @@ class GroqBackend:
         tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
         timeout_seconds: float | None = None,
+        model: str | None = None,
     ) -> ChatResult:
         openai_messages = []
         if system:
@@ -172,77 +172,179 @@ class GroqBackend:
         max_backoff_seconds = 4
         deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
-        models_tried: list[str] = []
-        for model_index, model in enumerate(self.chain):
-            models_tried.append(model)
-            payload["model"] = model
-            for attempt in range(max_retries):
-                request_timeout = 60.0
-                if deadline is not None:
-                    request_timeout = deadline - time.monotonic()
-                    if request_timeout <= 0:
-                        raise TimeoutError("Groq request exceeded the tool-loop time budget.")
-                try:
-                    resp = requests.post(
-                        f"{self.base_url}/chat/completions",
-                        headers={"Authorization": f"Bearer {self.api_key}"},
-                        json=payload,
-                        timeout=min(60.0, request_timeout),
-                    )
-                except requests.Timeout as exc:
-                    raise TimeoutError("Groq request exceeded the tool-loop time budget.") from exc
-
-                if resp.status_code == 429:
-                    if attempt < max_retries - 1:
-                        retry_after = resp.headers.get("Retry-After")
-                        try:
-                            sleep_time = float(retry_after) if retry_after else backoff_base ** (attempt + 1)
-                        except ValueError:
-                            sleep_time = backoff_base ** (attempt + 1)
-                        sleep_time = min(sleep_time, max_backoff_seconds)
-                        if deadline is not None:
-                            remaining = deadline - time.monotonic()
-                            if remaining <= 0:
-                                raise TimeoutError("Groq retry exceeded the tool-loop time budget.")
-                            sleep_time = min(sleep_time, remaining)
-                        time.sleep(sleep_time)
-                    continue
-
-                if not (200 <= resp.status_code < 300):
-                    resp.raise_for_status()
-
-                data = resp.json()
-                choice = data["choices"][0]
-                message = choice["message"]
-                text = message.get("content") or ""
-
-                tool_calls = []
-                for tc in message.get("tool_calls", []) or []:
-                    fn = tc.get("function", {})
-                    args = fn.get("arguments", {})
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except json.JSONDecodeError:
-                            args = {}
-                    tool_calls.append(ToolCall(id=tc["id"], name=fn.get("name", ""), input=args))
-
-                return ChatResult(
-                    text=text.strip(),
-                    tool_calls=tool_calls,
-                    stop_reason=choice.get("finish_reason"),
-                    raw=data,
-                    model_used=model,
+        if not model:
+            raise ValueError("A Groq model is required.")
+        payload["model"] = model
+        for attempt in range(max_retries):
+            request_timeout = 60.0
+            if deadline is not None:
+                request_timeout = deadline - time.monotonic()
+                if request_timeout <= 0:
+                    raise TimeoutError("Groq request exceeded the tool-loop time budget.")
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=payload,
+                    timeout=min(60.0, request_timeout),
                 )
+            except requests.Timeout as exc:
+                raise TimeoutError("Groq request exceeded the tool-loop time budget.") from exc
 
-            if model_index < len(self.chain) - 1:
-                print(f"{model} exhausted (429), falling back to {self.chain[model_index + 1]}")
+            if resp.status_code == 429:
+                if attempt < max_retries - 1:
+                    retry_after = resp.headers.get("Retry-After")
+                    try:
+                        sleep_time = float(retry_after) if retry_after else backoff_base ** (attempt + 1)
+                    except ValueError:
+                        sleep_time = backoff_base ** (attempt + 1)
+                    sleep_time = min(sleep_time, max_backoff_seconds)
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("Groq retry exceeded the tool-loop time budget.")
+                        sleep_time = min(sleep_time, remaining)
+                    time.sleep(sleep_time)
+                continue
 
-        raise RuntimeError(
-            "Groq free-tier daily limit exhausted for all configured models: "
-            f"{', '.join(models_tried)}. Wait for the limit to reset or temporarily set "
-            "routing.default_tier to 'premium' in config.yaml."
-        )
+            if not (200 <= resp.status_code < 300):
+                resp.raise_for_status()
+
+            data = resp.json()
+            choice = data["choices"][0]
+            message = choice["message"]
+            text = message.get("content") or ""
+            tool_calls = []
+            for tc in message.get("tool_calls", []) or []:
+                fn = tc.get("function", {})
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                tool_calls.append(ToolCall(id=tc["id"], name=fn.get("name", ""), input=args))
+
+            return ChatResult(
+                text=text.strip(),
+                tool_calls=tool_calls,
+                stop_reason=choice.get("finish_reason"),
+                raw=data,
+                model_used=model,
+            )
+
+        raise RuntimeError(f"Groq model {model} exhausted after {max_retries} attempts.")
+
+
+class GeminiBackend:
+    """Free Gemini tier using Google's generateContent REST API."""
+
+    supports_tools = True
+
+    def __init__(self, settings: Settings):
+        if not settings.gemini_api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not set. Add it to .env to use the free_api tier "
+                "(get one free at https://aistudio.google.com/apikey)."
+            )
+        self.api_key = settings.gemini_api_key
+        self.max_tokens = settings.free_api_model.get("max_tokens", 2048)
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        system: str | None = None,
+        timeout_seconds: float | None = None,
+        model: str | None = None,
+    ) -> ChatResult:
+        if not model:
+            raise ValueError("A Gemini model is required.")
+        payload: dict[str, Any] = {
+            "contents": self._contents(messages),
+            "generationConfig": {"maxOutputTokens": self.max_tokens},
+        }
+        if system:
+            payload["system_instruction"] = {"parts": [{"text": system}]}
+        if tools:
+            payload["tools"] = [{
+                "function_declarations": [
+                    {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+                    }
+                    for tool in tools
+                ]
+            }]
+
+        timeout = timeout_seconds or 60.0
+        for attempt in range(3):
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}",
+                json=payload,
+                timeout=min(60.0, timeout),
+            )
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            exhausted = resp.status_code == 429 or data.get("error", {}).get("status") == "RESOURCE_EXHAUSTED"
+            if exhausted:
+                if attempt < 2:
+                    time.sleep(min(2 ** (attempt + 1), 4))
+                continue
+            if not (200 <= resp.status_code < 300):
+                resp.raise_for_status()
+
+            candidate = data.get("candidates", [{}])[0]
+            parts = candidate.get("content", {}).get("parts", [])
+            text_parts = [part["text"] for part in parts if "text" in part]
+            tool_calls = []
+            for index, part in enumerate(parts):
+                function_call = part.get("functionCall")
+                if function_call:
+                    tool_calls.append(
+                        ToolCall(
+                            id=f"gemini-{index}-{int(time.time())}",
+                            name=function_call.get("name", ""),
+                            input=function_call.get("args", {}),
+                        )
+                    )
+            return ChatResult(
+                text="\n".join(text_parts).strip(),
+                tool_calls=tool_calls,
+                stop_reason=candidate.get("finishReason"),
+                raw=data,
+                model_used=model,
+            )
+        raise RuntimeError(f"Gemini model {model} exhausted after 3 attempts.")
+
+    @staticmethod
+    def _contents(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        tool_names: dict[str, str] = {}
+        contents = []
+        for message in messages:
+            role = "model" if message.get("role") == "assistant" else "user"
+            raw_content = message.get("content", "")
+            blocks = raw_content if isinstance(raw_content, list) else [{"type": "text", "text": raw_content}]
+            parts = []
+            for block in blocks:
+                if not isinstance(block, dict):
+                    parts.append({"text": str(block)})
+                elif block.get("type") == "text":
+                    parts.append({"text": block.get("text", "")})
+                elif block.get("type") == "tool_use":
+                    tool_names[block.get("id", "")] = block.get("name", "")
+                    parts.append({"functionCall": {"name": block.get("name", ""), "args": block.get("input", {})}})
+                elif block.get("type") == "tool_result":
+                    parts.append({"functionResponse": {
+                        "name": tool_names.get(block.get("tool_use_id", ""), ""),
+                        "response": {"content": block.get("content", "")},
+                    }})
+            if parts:
+                contents.append({"role": role, "parts": parts})
+        return contents
 
 
 class OllamaBackend:
@@ -340,7 +442,7 @@ class ModelRouter:
         self.settings = settings
         self._premium: AnthropicBackend | None = None
         self._local: OllamaBackend | None = None
-        self._free_api: GroqBackend | None = None
+        self._free_api: dict[str, GroqBackend | GeminiBackend] = {}
 
     def _get_premium(self) -> AnthropicBackend:
         if self._premium is None:
@@ -352,23 +454,31 @@ class ModelRouter:
             self._local = OllamaBackend(self.settings)
         return self._local
 
-    def _get_free_api(self) -> GroqBackend:
-        if self._free_api is None:
-            self._free_api = GroqBackend(self.settings)
-        return self._free_api
+    def _get_free_api(self, provider: str) -> GroqBackend | GeminiBackend:
+        if provider not in self._free_api:
+            if provider == "groq":
+                self._free_api[provider] = GroqBackend(self.settings)
+            elif provider == "gemini":
+                self._free_api[provider] = GeminiBackend(self.settings)
+            else:
+                raise ValueError(f"Unsupported free_api provider: {provider}")
+        return self._free_api[provider]
 
     def pick_tier(self, latest_user_message: str) -> str:
         routing = self.settings.routing
         msg_lower = latest_user_message.lower()
 
         if len(latest_user_message) > routing.get("long_message_char_threshold", 400):
-            return "premium"
+            selected = "premium"
+        else:
+            selected = next(
+                ("premium" for kw in routing.get("premium_keywords", []) if kw.lower() in msg_lower),
+                routing.get("default_tier", "free_api"),
+            )
 
-        for kw in routing.get("premium_keywords", []):
-            if kw.lower() in msg_lower:
-                return "premium"
-
-        return routing.get("default_tier", "free_api")
+        if selected == "premium" and not self.settings.allow_premium:
+            return "free_api"
+        return selected
 
     def backend_for(self, tier: str):
         if tier == "premium":
@@ -376,7 +486,10 @@ class ModelRouter:
         if tier == "local":
             return self._get_local()
         if tier == "free_api":
-            return self._get_free_api()
+            chain = self.settings.free_api_model.get("chain", [])
+            if not chain:
+                raise RuntimeError("Free API model chain is empty. Add models.free_api.chain to config.yaml.")
+            return self._get_free_api(chain[0]["provider"])
         raise ValueError(f"Unknown tier: {tier}")
 
     def chat(
@@ -386,8 +499,56 @@ class ModelRouter:
         tools: list[dict[str, Any]] | None = None,
         system: str | None = None,
         timeout_seconds: float | None = None,
+        force_chain_start_index: int | None = None,
     ) -> ChatResult:
-        backend = self.backend_for(tier)
         if tier == "free_api":
-            return backend.chat(messages, tools=tools, system=system, timeout_seconds=timeout_seconds)
+            chain = self.settings.free_api_model.get("chain", [])
+            if not chain:
+                raise RuntimeError("Free API model chain is empty. Add models.free_api.chain to config.yaml.")
+            start_index = force_chain_start_index if force_chain_start_index is not None else 0
+            if start_index < 0 or start_index >= len(chain):
+                raise ValueError(f"Invalid free_api chain start index: {start_index}")
+            tried = []
+            for index in range(start_index, len(chain)):
+                entry = chain[index]
+                provider = entry["provider"]
+                model = entry["model"]
+                tried.append(f"{provider}:{model}")
+                try:
+                    backend = self._get_free_api(provider)
+                    result = backend.chat(
+                        messages,
+                        tools=tools,
+                        system=system,
+                        timeout_seconds=timeout_seconds,
+                        model=model,
+                    )
+                    result.model_used = f"{provider}:{model}"
+                    return result
+                except TimeoutError:
+                    raise
+                except RuntimeError as exc:
+                    if "GEMINI_API_KEY" in str(exc):
+                        raise
+                    if index < len(chain) - 1:
+                        next_entry = chain[index + 1]
+                        print(
+                            f"model {provider}:{model} exhausted, falling back to "
+                            f"{next_entry['provider']}:{next_entry['model']}"
+                        )
+                except Exception:
+                    if index < len(chain) - 1:
+                        next_entry = chain[index + 1]
+                        print(
+                            f"model {provider}:{model} exhausted, falling back to "
+                            f"{next_entry['provider']}:{next_entry['model']}"
+                        )
+            raise RuntimeError(
+                "Free API daily limit exhausted for all configured models: "
+                f"{', '.join(tried)}. Wait for the limits to reset or temporarily set "
+                "routing.allow_premium to true in config.yaml."
+            )
+        if tier == "premium" and not self.settings.allow_premium:
+            raise ValueError("Premium tier is disabled by routing.allow_premium: false in config.yaml.")
+        backend = self.backend_for(tier)
         return backend.chat(messages, tools=tools, system=system)

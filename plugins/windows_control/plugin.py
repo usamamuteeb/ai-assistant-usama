@@ -236,10 +236,7 @@ class CloseWindowTool(_ConfirmedWindowsTool):
 
 class SendKeystrokesFallbackTool(_ConfirmedWindowsTool):
     name = "send_keystrokes_fallback"
-    description = (
-        "Fallback only: type raw text or press special keys with pyautogui into whichever Windows window is CURRENTLY FOCUSED, "
-        "not a specific target window. Use only when direct control targeting cannot work, and only after explicit confirmation."
-    )
+    description = "Fallback tool to type text or special keys into the currently focused Windows window after confirmation."
     input_schema = {
         "type": "object",
         "properties": {

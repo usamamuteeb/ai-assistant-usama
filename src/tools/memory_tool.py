@@ -9,11 +9,7 @@ from .base import Tool
 
 class MemorySearchTool(Tool):
     name = "search_memory"
-    description = (
-        "Search long-term memory for past notes, facts, or conversation snippets "
-        "relevant to a query. Use this when you need something you were told "
-        "previously but it isn't in the current conversation."
-    )
+    description = "Search long-term memory for notes, facts, or conversation snippets missing from the current context."
     input_schema = {
         "type": "object",
         "properties": {

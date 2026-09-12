@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import platform
 import re
@@ -22,11 +23,41 @@ from nicegui import app, run, ui
 
 from src.config import load_settings
 from src.orchestrator import Orchestrator
+from src.voice import speak_text, transcribe_audio
 
-TIER_OPTIONS = ["auto", "local", "premium", "free_api"]
 APPROVAL_MODES = ["manual", "auto"]
 PAGE_TITLE = "Personal AI Assistant"
 REQUEST_UI_TIMEOUT_SECONDS = 90
+VOICE_RECORD_JS = """
+async (event) => {
+    const button = event.currentTarget;
+    if (window.__assistantVoiceRecorder) {
+        window.__assistantVoiceRecorder.stop();
+        return;
+    }
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+        const recorder = new MediaRecorder(stream);
+        const chunks = [];
+        recorder.ondataavailable = (recordedEvent) => {
+            if (recordedEvent.data.size > 0) chunks.push(recordedEvent.data);
+        };
+        recorder.onstop = () => {
+            stream.getTracks().forEach((track) => track.stop());
+            window.__assistantVoiceRecorder = null;
+            button.classList.remove('voice-recording');
+            const reader = new FileReader();
+            reader.onloadend = () => emit(reader.result.split(',')[1] || '');
+            reader.readAsDataURL(new Blob(chunks, {type: recorder.mimeType || 'audio/webm'}));
+        };
+        window.__assistantVoiceRecorder = recorder;
+        button.classList.add('voice-recording');
+        recorder.start();
+    } catch (error) {
+        console.error('Microphone access failed:', error);
+    }
+}
+"""
 logger = logging.getLogger(__name__)
 _pending_confirmations: dict[str, dict[str, Any]] = {}
 _pending_lock = threading.Lock()
@@ -42,6 +73,21 @@ _ui_settings = load_settings()
 _browser_screenshots_dir = _ui_settings.workspace_root() / "screenshots"
 _browser_screenshots_dir.mkdir(parents=True, exist_ok=True)
 app.add_static_files("/browser-screenshots", _browser_screenshots_dir)
+
+
+def _model_label(provider: str, model: str) -> str:
+    readable_model = model.rsplit("/", 1)[-1].replace("-", " ").replace("_", " ")
+    readable_model = " ".join(
+        word.upper() if word.isdigit() else word.title() for word in readable_model.split()
+    )
+    return f"{provider.title()}: {readable_model}"
+
+
+MODEL_OPTIONS: dict[str, str] = {"auto": "Auto", "local": "Local (Ollama)"}
+for _index, _entry in enumerate(_ui_settings.free_api_model.get("chain", [])):
+    MODEL_OPTIONS[f"free_api:{_index}"] = _model_label(_entry["provider"], _entry["model"])
+if _ui_settings.routing.get("allow_premium", True):
+    MODEL_OPTIONS["premium"] = "Premium (Claude)"
 _LEGACY_SCREENSHOT_MARKDOWN = re.compile(
     r"(!\[[^\]]*\]\()\s*(?:\./)?workspace/screenshots/([^\s)]+)(\))"
 )
@@ -156,8 +202,16 @@ _dispatch_confirm.manual_confirm = _dispatch_manual_confirm
 orchestrator = Orchestrator(_ui_settings, confirm_fn=_dispatch_confirm)
 
 
-def _force_tier(selection: str) -> str | None:
-    return None if selection == "auto" else selection
+def _selection_args(selection: str) -> tuple[str | None, int | None]:
+    if selection == "auto":
+        return None, None
+    if selection == "local":
+        return "local", None
+    if selection == "premium":
+        return "premium", None
+    if selection.startswith("free_api:"):
+        return "free_api", int(selection.split(":", 1)[1])
+    raise ValueError(f"Unknown model selection: {selection}")
 
 
 def _chat_markdown(content: str) -> str:
@@ -213,6 +267,8 @@ def _render_history(chat_log: ui.column, history: list[dict[str, str]]) -> None:
                 sent=sent,
             ).classes(f"assistant-message {message_class}"):
                 ui.markdown(_chat_markdown(entry["content"])).classes("chat-markdown")
+                if not sent and entry.get("model_used"):
+                    ui.label(f"via {entry['model_used']}").classes("model-used-caption")
 
 
 def _show_confirmation(session_id: str, dialog_holder: dict[str, Any]) -> None:
@@ -250,6 +306,9 @@ def main() -> None:
     client.setdefault("chat_history", [])
     client.setdefault("approval_mode", "auto")
     client.setdefault("selected_tier", "auto")
+    client.setdefault("read_replies_aloud", False)
+    if client["selected_tier"] not in MODEL_OPTIONS:
+        client["selected_tier"] = "auto"
     session_id = client["session_id"]
     _session_confirm_fns.setdefault(session_id, _make_confirm_fn(session_id))
     _approval_modes.setdefault(session_id, client["approval_mode"])
@@ -293,6 +352,7 @@ def main() -> None:
         .assistant-message .q-message-name { margin: 0 0 .35rem .25rem; color: #aeb4be; font-size: .7rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
         .assistant-message .q-message-text { width: fit-content !important; max-width: 76% !important; min-width: 122px; margin: 0; word-break: normal; overflow-wrap: anywhere; }
         .assistant-message .q-message-text-content { width: 100%; padding: .9rem 1rem; border-radius: 14px; box-shadow: 0 8px 20px rgba(0,0,0,.14); }
+        .model-used-caption { margin: .35rem 0 0 .25rem; color: #858b96; font-size: .68rem; }
         .message-user .q-message-text, .message-user .q-message-text--sent, .message-user .q-message-text-content, .message-user .q-message-text-content--sent { background: linear-gradient(145deg, #56191e, #3b1115) !important; color: #fff !important; }
         .message-assistant .q-message-text, .message-assistant .q-message-text--received, .message-assistant .q-message-text-content, .message-assistant .q-message-text-content--received { background: #24262a !important; color: #f5f6f8 !important; }
         .message-assistant .q-message-text { width: min(76%, 780px) !important; min-width: 190px; border: 1px solid rgba(255,255,255,.055); }
@@ -322,6 +382,8 @@ def main() -> None:
         .assistant-input-field input, .assistant-input-field .q-field__native { color: #f8fafc !important; -webkit-text-fill-color: #f8fafc !important; caret-color: #fff !important; opacity: 1 !important; }
         .assistant-input-field input::placeholder { color: #9da4af !important; opacity: 1; }
         .assistant-send { min-height: 50px; min-width: 108px; padding: 0 1.1rem; border-radius: 10px; color: #fff !important; font-weight: 700; letter-spacing: .01em; }
+        .voice-input-button { min-height: 50px; min-width: 50px; color: #cdd2da; }
+        .voice-input-button.voice-recording { color: #ff5963; background: rgba(209,32,44,.18); }
         .compose-helper { padding-left: 2rem; }
         @media (max-width: 900px) {
             .assistant-header, .assistant-chat { width: calc(100vw - 2rem); }
@@ -350,8 +412,13 @@ def main() -> None:
         ).props("inline").classes("approval-toggle")
         ui.label("Model routing").classes("sidebar-section-label")
         ui.label("Select the model tier for this conversation.").classes("setting-copy")
-        ui.select(TIER_OPTIONS, value=client["selected_tier"], label="Tier",
+        ui.select(MODEL_OPTIONS, value=client["selected_tier"], label="Model",
                   on_change=lambda e: client.__setitem__("selected_tier", e.value)).classes("w-full assistant-tier")
+        ui.checkbox(
+            "Read replies aloud",
+            value=client["read_replies_aloud"],
+            on_change=lambda e: client.__setitem__("read_replies_aloud", e.value),
+        ).classes("voice-output-toggle")
         with ui.column().classes("sidebar-footer"):
             ui.label("Private by design").classes("sidebar-footer-title")
             ui.label("Your chat stays in this local assistant session.").classes("sidebar-footer-copy")
@@ -370,6 +437,22 @@ def main() -> None:
 
     dialog_holder: dict[str, Any] = {}
     sending = {"active": False}
+
+    async def handle_audio_event(event: Any) -> None:
+        payload = event.args[0] if isinstance(event.args, list) and event.args else event.args
+        if not isinstance(payload, str) or not payload:
+            return
+        try:
+            audio_bytes = base64.b64decode(payload)
+        except Exception:
+            ui.notify("The recorded audio could not be decoded.", type="negative")
+            return
+        transcript = await run.io_bound(transcribe_audio, audio_bytes)
+        if transcript:
+            message_input.value = transcript
+            message_input.update()
+        else:
+            ui.notify("I could not transcribe that recording.", type="warning")
 
     async def send_message() -> None:
         global _active_request_task, _active_session_id
@@ -391,7 +474,8 @@ def main() -> None:
                     orchestrator.handle_message,
                     session_id,
                     user_message,
-                    force_tier=_force_tier(client["selected_tier"]),
+                    force_tier=_selection_args(client["selected_tier"])[0],
+                    force_chain_start_index=_selection_args(client["selected_tier"])[1],
                 )
             )
             _active_request_task = task
@@ -411,8 +495,11 @@ def main() -> None:
         except Exception as exc:
             traceback.print_exc()
             reply = f"[error] {exc}"
-        history.append({"role": "assistant", "content": reply})
+        model_used = orchestrator.get_last_model_used(session_id)
+        history.append({"role": "assistant", "content": reply, "model_used": model_used})
         _render_history(chat_log, history)
+        if client["read_replies_aloud"] and not reply.startswith("[error]"):
+            await run.io_bound(speak_text, reply)
         await ui.run_javascript(
             "const log = document.querySelector('.assistant-chat'); "
             "if (log) log.scrollTop = log.scrollHeight;"
@@ -426,6 +513,9 @@ def main() -> None:
                 message_input = ui.input(placeholder="Message the assistant").props("outlined") \
                     .classes("assistant-input-field flex-grow").style("background-color: #292a2e; color: #f8fafc;") \
                     .on("keydown.enter", send_message)
+                ui.button(icon="mic", on_click=None).props("flat round").classes("voice-input-button").on(
+                    "click", handle_audio_event, js_handler=VOICE_RECORD_JS
+                ).tooltip("Record voice input")
                 ui.button("Send", on_click=send_message, icon="send", color="primary").classes("assistant-send")
             ui.label("Enter to send · Tool approvals appear here when needed").classes("compose-helper")
 

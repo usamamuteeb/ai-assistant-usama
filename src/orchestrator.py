@@ -6,6 +6,7 @@ elsewhere.
 """
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Optional
 
@@ -24,6 +25,9 @@ If asked what you can do, what features or tools you have, or similar meta-quest
 your own capabilities, answer directly from your knowledge of the tools available in this
 conversation. Do not call tools to answer capability questions. Only call tools when the
 user is asking you to actually do or look up something.
+Only call a tool when it's necessary to directly fulfill what the user asked. Do not proactively
+call additional tools to gather extra context, verify assumptions, or check related information
+the user did not request — if something is ambiguous, ask the user instead of investigating via tools.
 """
 
 MAX_TOOL_ITERATIONS = 10
@@ -46,12 +50,20 @@ class Orchestrator:
             settings.chroma_path(), settings.memory.get("chroma_collection", "assistant_memory")
         )
         self.tools: ToolRegistry = build_registry(settings, self.vector_memory, confirm_fn=confirm_fn)
+        self._last_model_used: dict[str, str] = {}
+        tool_schemas = self.tools.anthropic_tools()
+        schema_tokens = sum(len(json.dumps(schema)) for schema in tool_schemas) // 4
+        print(
+            f"Tool schema overhead: ~{schema_tokens} tokens sent on every request "
+            f"across {len(tool_schemas)} tools."
+        )
 
     def handle_message(
         self,
         session_id: str,
         user_message: str,
         force_tier: Optional[str] = None,
+        force_chain_start_index: int | None = None,
     ) -> str:
         tier = force_tier or self.router.pick_tier(user_message)
         self.store.log_model_call(tier, user_message)
@@ -63,7 +75,14 @@ class Orchestrator:
         messages: list[dict[str, Any]] = [{"role": h["role"], "content": h["content"]} for h in history]
 
         anthropic_tools = self.tools.anthropic_tools()
-        final_text = self._run_tool_loop(tier, messages, anthropic_tools)
+        final_result = self._run_tool_loop(
+            tier,
+            messages,
+            anthropic_tools,
+            force_chain_start_index=force_chain_start_index,
+        )
+        self._last_model_used[session_id] = final_result.model_used or "unknown"
+        final_text = final_result.text
 
         self.store.log_message(session_id, "assistant", final_text)
         # Keep a lightweight semantic trace so search_memory has something to find later.
@@ -73,17 +92,26 @@ class Orchestrator:
         )
         return final_text
 
+    def get_last_model_used(self, session_id: str) -> str | None:
+        return self._last_model_used.get(session_id)
+
     def _run_tool_loop(
         self,
         tier: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-    ) -> str:
+        force_chain_start_index: int | None = None,
+    ) -> ChatResult:
         start = time.monotonic()
+        executed_results: dict[tuple[str, Any], str] = {}
+        last_model_used: str | None = None
         for _ in range(MAX_TOOL_ITERATIONS):
             elapsed = time.monotonic() - start
             if elapsed > MAX_TOOL_LOOP_SECONDS:
-                return self._stopped_tool_loop_response(messages, elapsed_seconds=elapsed)
+                return ChatResult(
+                    text=self._stopped_tool_loop_response(messages, elapsed_seconds=elapsed),
+                    model_used=last_model_used,
+                )
 
             try:
                 result: ChatResult = self.router.chat(
@@ -92,15 +120,26 @@ class Orchestrator:
                     tools=tools,
                     system=SYSTEM_PROMPT,
                     timeout_seconds=MAX_TOOL_LOOP_SECONDS - elapsed,
+                    force_chain_start_index=force_chain_start_index,
                 )
+                last_model_used = result.model_used
             except TimeoutError:
-                return self._stopped_tool_loop_response(
-                    messages,
-                    elapsed_seconds=time.monotonic() - start,
+                return ChatResult(
+                    text=self._stopped_tool_loop_response(
+                        messages,
+                        elapsed_seconds=time.monotonic() - start,
+                    ),
+                    model_used=last_model_used,
                 )
 
             if not result.tool_calls:
-                return result.text or "(no response)"
+                return ChatResult(
+                    text=result.text or "(no response)",
+                    tool_calls=result.tool_calls,
+                    stop_reason=result.stop_reason,
+                    raw=result.raw,
+                    model_used=result.model_used,
+                )
 
             # Record the assistant's tool-use turn, then feed back tool results.
             assistant_content = []
@@ -115,8 +154,17 @@ class Orchestrator:
             tool_result_blocks = []
             confirmation_denied_action = None
             for tc in result.tool_calls:
-                output = self.tools.call(tc.name, **tc.input)
-                output_str = str(output)
+                try:
+                    input_key: Any = frozenset(tc.input.items())
+                except TypeError:
+                    input_key = json.dumps(tc.input, sort_keys=True)
+                cache_key = (tc.name, input_key)
+                if cache_key in executed_results:
+                    output_str = executed_results[cache_key]
+                else:
+                    output = self.tools.call(tc.name, **tc.input)
+                    output_str = str(output)
+                    executed_results[cache_key] = output_str
                 if len(output_str) > 4000:
                     output_str = output_str[:4000] + "... [truncated]"
                 tool_result_blocks.append(
@@ -135,11 +183,14 @@ class Orchestrator:
             if confirmation_denied_action:
                 tool_name, tool_input = confirmation_denied_action
                 action_desc = self._describe_tool_action(tool_name, tool_input)
-                return f"Waiting for your approval on: {action_desc}. Approve or deny it to continue."
+                return ChatResult(
+                    text=f"Waiting for your approval on: {action_desc}. Approve or deny it to continue.",
+                    model_used=last_model_used,
+                )
 
             messages.append({"role": "user", "content": tool_result_blocks})
 
-        return self._stopped_tool_loop_response(messages)
+        return ChatResult(text=self._stopped_tool_loop_response(messages), model_used=last_model_used)
 
     @staticmethod
     def _stopped_tool_loop_response(

@@ -15,6 +15,7 @@ it into whatever shape your use cases need. You can still run Goose/n8n alongsid
   using Anthropic's native tool-use format.
 - **Three real tools**: filesystem (read/write/list, sandboxed to a workspace folder), shell command
   execution (with a safety confirmation switch), and a memory-search tool.
+- **Clipboard tools**: read and write the system clipboard through the local clipboard plugin.
 - **Memory**: SQLite for structured state + conversation log, Chroma (local vector DB) for semantic
   long-term memory. Both are real, working stores, not stubs.
 - **Plugin system**: drop a folder in `plugins/`, export a `register()` function, restart — it's now a tool
@@ -69,6 +70,16 @@ Stop it with:
 ```powershell
 Ctrl+C
 ```
+
+## Voice input/output
+
+The web UI includes local microphone transcription and optional spoken replies.
+Voice input uses the offline `faster-whisper` base model, which downloads a model
+file of a few hundred MB on first use; after that download completes, transcription
+runs fully offline. Change the model in `src/voice.py` to `small` or `medium` if
+you prefer higher accuracy over speed. Voice input requires microphone permission
+in the browser. Enable **Read replies aloud** in the sidebar to use the system's
+default audio output for assistant replies.
 
 ## Windows desktop control setup
 

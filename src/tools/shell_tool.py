@@ -16,11 +16,7 @@ ConfirmFn = Callable[[str], bool]
 
 class ShellTool(Tool):
     name = "run_shell_command"
-    description = (
-        "Execute a shell command on the local machine and return stdout/stderr/exit code. "
-        "Use this for automation tasks: running scripts, installing packages, checking system state, etc. "
-        "Be specific and prefer non-destructive commands."
-    )
+    description = "Execute a specific shell command and return its output and exit code, with confirmation when required."
     input_schema = {
         "type": "object",
         "properties": {
