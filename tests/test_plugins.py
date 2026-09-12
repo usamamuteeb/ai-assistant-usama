@@ -200,17 +200,104 @@ def test_google_search_shapes_mocked_api_response():
     assert result == {"query": "is:unread", "count": 0, "results": []}
 
 
-def test_image_generation_handles_mocked_quota_response():
+def test_image_generation_reports_unavailable_local_server():
     module = _load_plugin("image_generation")
     tool = module.GenerateImageTool()
-    tool.api_key = "fake-key"
-    response = MagicMock(status_code=429, text="quota")
-    response.json.return_value = {"error": {"message": "quota"}}
-    with patch.object(module.requests, "post", return_value=response) as post:
+    tool.config = {"auto_start": False, "start_timeout_seconds": 1}
+    with patch.object(module.requests, "get", side_effect=module.requests.ConnectionError("offline")):
         result = tool.run("draw a test image")
 
-    assert "isn't available" in result["error"]
-    post.assert_called_once()
+    assert "Local image generation is unavailable" in result["error"]
+
+
+def test_image_generation_refuses_when_free_memory_is_below_configured_minimum():
+    module = _load_plugin("image_generation")
+    tool = module.GenerateImageTool()
+    tool.image_generation_config = {"generate_image_min_free_ram_gb": 1.5}
+    memory = MagicMock(available=1024**3)
+    with patch.object(module.psutil, "virtual_memory", return_value=memory), patch.object(
+        tool, "_ensure_server_ready"
+    ) as ready:
+        result = tool.run("draw a test image")
+
+    assert "Only 1.0GB RAM free" in result["error"]
+    assert "at least 1.5GB" in result["error"]
+    ready.assert_not_called()
+
+
+def test_image_generation_starts_one_local_setup_process(tmp_path):
+    module = _load_plugin("image_generation")
+    tool = module.GenerateImageTool(root=tmp_path)
+    tool.config = {"auto_start": True, "auto_install": True, "install_dir": "data/comfyui"}
+    with patch.object(tool, "_server_ready", return_value=False), patch.object(
+        module.subprocess, "Popen"
+    ) as start:
+        start.return_value.pid = 1234
+        tool.start_if_configured()
+
+    assert start.call_args.args[0][-1] == "src.comfyui_setup"
+    assert (tmp_path / "data" / "comfyui" / ".setup.lock").is_file()
+
+
+def test_image_generation_exposes_failed_setup_status(tmp_path):
+    module = _load_plugin("image_generation")
+    setup_dir = tmp_path / "data" / "comfyui"
+    setup_dir.mkdir(parents=True)
+    (setup_dir / "setup_status.json").write_text(
+        '{"state": "failed", "phase": "source", "detail": "Connection reset", "updated_at": "now"}',
+        encoding="utf-8",
+    )
+    (setup_dir / "setup.log").write_text("clone failed\nconnection reset\n", encoding="utf-8")
+    tool = module.GenerateImageTool(root=tmp_path)
+    tool.config = {"install_dir": "data/comfyui"}
+    with patch.object(tool, "_server_ready", return_value=False):
+        status = tool.get_setup_status()
+
+    assert status["state"] == "failed"
+    assert status["phase"] == "source"
+    assert status["can_retry"] is True
+    assert status["log_tail"] == ["clone failed", "connection reset"]
+
+
+def test_image_generation_does_not_wait_for_background_setup(tmp_path):
+    module = _load_plugin("image_generation")
+    tool = module.GenerateImageTool(root=tmp_path)
+    tool.config = {"auto_start": True, "start_timeout_seconds": 120}
+    with patch.object(tool, "_server_ready", return_value=False), patch.object(
+        tool, "start_if_configured"
+    ) as start:
+        tool._start_error = "Initial local ComfyUI setup has started."
+        result = tool._ensure_server_ready()
+
+    assert "Initial local ComfyUI setup has started" in result
+    start.assert_called_once()
+
+
+def test_image_generation_saves_mocked_local_comfyui_output(tmp_path):
+    module = _load_plugin("image_generation")
+    tool = module.GenerateImageTool(root=tmp_path)
+    tool.config = {
+        "url": "http://127.0.0.1:8188",
+        "checkpoint": "test.safetensors",
+        "timeout_seconds": 1,
+    }
+    prompt_response = MagicMock(status_code=200)
+    prompt_response.json.return_value = {"prompt_id": "request-1"}
+    history_response = MagicMock(status_code=200)
+    history_response.json.return_value = {
+        "request-1": {"outputs": {"7": {"images": [{"filename": "result.png", "subfolder": "", "type": "output"}]}}}
+    }
+    image_response = MagicMock(status_code=200, content=b"fake-image")
+    image_response.headers = {"content-type": "image/png"}
+    ready_response = MagicMock(status_code=200)
+    with patch.object(module.requests, "post", return_value=prompt_response), patch.object(
+        module.requests, "get", side_effect=[ready_response, history_response, image_response]
+    ):
+        result = tool.run("a local test image")
+
+    assert result["backend"] == "local_comfyui"
+    assert result["model"] == "test.safetensors"
+    assert (tmp_path / "workspace" / result["path"]).read_bytes() == b"fake-image"
 
 
 def test_screen_reader_uses_mocked_capture_and_ocr():

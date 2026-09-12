@@ -10,6 +10,7 @@ TOOLS = [
     {"name": "system_stats", "description": "Report CPU memory and disk usage."},
     {"name": "web_search", "description": "Search the public web."},
     {"name": "filesystem", "description": "Read and write workspace files."},
+    {"name": "generate_image", "description": "Generate an image, picture, drawing, art, or illustration."},
 ]
 
 
@@ -23,6 +24,12 @@ def test_core_tools_are_always_selected_even_without_keyword_overlap():
     selected = select_relevant_tools("hello there", TOOLS, 4, 1, {"filesystem", "search_memory"})
 
     assert {"filesystem", "search_memory"}.issubset({tool["name"] for tool in selected})
+
+
+def test_image_generation_can_be_pinned_as_a_core_tool():
+    selected = select_relevant_tools("hello there", TOOLS, 4, 1, {"generate_image"})
+
+    assert "generate_image" in {tool["name"] for tool in selected}
 
 
 def test_ambiguous_request_honors_the_minimum_tool_floor():

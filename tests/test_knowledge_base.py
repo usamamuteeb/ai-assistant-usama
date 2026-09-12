@@ -1,7 +1,8 @@
 """Local behavior tests for the knowledge-base ingest tool."""
 from __future__ import annotations
 
-from plugins.knowledge_base.plugin import KnowledgeBaseTool
+from plugins.knowledge_base.plugin import KnowledgeBaseSearchTool, KnowledgeBaseTool
+import plugins.knowledge_base.plugin as knowledge_base_plugin
 
 
 class _StateStore:
@@ -71,3 +72,39 @@ knowledge_base:
     result = tool.run()
 
     assert result["total_chunks_added"] == 3
+
+
+def test_unicode_failure_is_reported_per_file_and_other_files_continue(tmp_path, monkeypatch):
+    (tmp_path / "bad.txt").write_text("bad", encoding="utf-8")
+    (tmp_path / "good.txt").write_text("good", encoding="utf-8")
+    tool = object.__new__(KnowledgeBaseTool)
+    tool.knowledge_base_dir = tmp_path
+    tool.store = _StateStore()
+    tool.vector_memory = _VectorStore()
+    tool.chunk_size = 1400
+    tool.chunk_overlap = 180
+
+    def extract_text(path):
+        if path.name == "bad.txt":
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte")
+        return "good"
+
+    monkeypatch.setattr(knowledge_base_plugin, "_extract_text", extract_text)
+
+    result = tool.run()
+
+    assert result["ingested_files"] == ["good.txt"]
+    assert result["total_chunks_added"] == 1
+    assert result["failed_files"] == [{"file": "bad.txt", "error": "'utf-8' codec can't decode byte 0xff in position 0: invalid byte"}]
+
+
+def test_knowledge_base_search_uses_indexed_vector_store():
+    class _SearchStore:
+        def search(self, query, k=5):
+            return [{"text": query, "metadata": {"source": "notes.md"}, "distance": 0.1}]
+
+    tool = KnowledgeBaseSearchTool(_SearchStore())
+
+    assert tool.run("what is in the document", k=2) == {
+        "results": [{"text": "what is in the document", "metadata": {"source": "notes.md"}, "distance": 0.1}]
+    }

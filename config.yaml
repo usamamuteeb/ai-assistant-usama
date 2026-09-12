@@ -56,6 +56,15 @@ tool_relevance_filter:
   core_tools:
     - filesystem
     - search_memory
+    - search_knowledge_base
+    - generate_image
+
+slow_tools:
+  # Local Stable Diffusion on CPU can take several minutes. This exception is
+  # deliberately limited to the image tool; every other tool retains the
+  # normal watchdog and 45-second loop budget.
+  generate_image:
+    max_seconds: 480
 
 memory:
   sqlite_path: data/sqlite.db
@@ -74,6 +83,30 @@ browser:
   # Keep browser actions visible on the desktop. Set this to true only when you
   # explicitly want unattended, invisible browser automation.
   headless: false
+
+image_generation:
+  # Images are generated locally. No Gemini image model or cloud image credits
+  # are used by this plugin.
+  generate_image_min_free_ram_gb: 1.5
+  local_comfyui:
+    url: http://127.0.0.1:8188
+    auto_install: true
+    auto_start: true
+    # The automated, project-local CPU installation lives here.
+    install_dir: data/comfyui
+    launch_script: run_cpu.bat
+    # Keep CPU generation practical on this computer; raise these only if a
+    # faster compatible GPU becomes available.
+    checkpoint: v1-5-pruned-emaonly-fp16.safetensors
+    width: 384
+    height: 384
+    steps: 15
+    cfg: 7.0
+    sampler_name: euler
+    scheduler: normal
+    negative_prompt: ""
+    start_timeout_seconds: 120
+    timeout_seconds: 600
 
 windows_control:
   # Keep desktop-affecting actions behind the browser confirmation dialog even

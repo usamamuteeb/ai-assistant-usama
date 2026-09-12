@@ -52,6 +52,7 @@ class KnowledgeBaseTool(Tool):
 
             ingested_files: list[str] = []
             skipped_unchanged: list[str] = []
+            failed_files: list[dict[str, str]] = []
             total_chunks_added = 0
             current_hashes: dict[str, str] = {}
 
@@ -59,30 +60,35 @@ class KnowledgeBaseTool(Tool):
                 if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
                     continue
                 filename = path.name
-                digest = _sha256(path)
-                current_hashes[filename] = digest
-                if previous_hashes.get(filename) == digest:
-                    skipped_unchanged.append(filename)
-                    continue
+                try:
+                    digest = _sha256(path)
+                    if previous_hashes.get(filename) == digest:
+                        current_hashes[filename] = digest
+                        skipped_unchanged.append(filename)
+                        continue
 
-                text = _extract_text(path)
-                chunks = _chunks(text, self.chunk_size, self.chunk_overlap)
-                if not chunks:
+                    text = _extract_text(path)
+                    chunks = _chunks(text, self.chunk_size, self.chunk_overlap)
+                    if chunks:
+                        for index, chunk in enumerate(chunks):
+                            self.vector_memory.add_memory(
+                                chunk,
+                                metadata={"source": filename, "chunk": index},
+                            )
+                        total_chunks_added += len(chunks)
+                    current_hashes[filename] = digest
                     ingested_files.append(filename)
-                    continue
-                for index, chunk in enumerate(chunks):
-                    self.vector_memory.add_memory(
-                        chunk,
-                        metadata={"source": filename, "chunk": index},
-                    )
-                total_chunks_added += len(chunks)
-                ingested_files.append(filename)
+                except (UnicodeDecodeError, UnicodeEncodeError) as exc:
+                    # Keep the batch moving and leave this file out of the
+                    # successful hash set so a later run retries it.
+                    failed_files.append({"file": filename, "error": str(exc)})
 
             self.store.set_state("kb_file_hashes", current_hashes)
             return {
                 "ingested_files": ingested_files,
                 "skipped_unchanged": skipped_unchanged,
                 "total_chunks_added": total_chunks_added,
+                "failed_files": failed_files,
             }
         except Exception as exc:  # plugin errors become model/UI-visible data
             return {"error": f"Knowledge-base ingestion failed: {exc}"}
@@ -115,6 +121,35 @@ class KnowledgeBaseTool(Tool):
         with config_path.open("r", encoding="utf-8") as handle:
             config = yaml.safe_load(handle) or {}
         return config if isinstance(config, dict) else {}
+
+
+class KnowledgeBaseSearchTool(Tool):
+    name = "search_knowledge_base"
+    description = (
+        "Search documents already ingested into the local knowledge base using semantic search. "
+        "Use this for questions about knowledge-base PDFs, TXT, or Markdown documents; "
+        "do not read the raw document with filesystem tools unless the user explicitly asks "
+        "for the file contents."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Question or information to find."},
+            "k": {"type": "integer", "description": "Maximum number of matching chunks, default 5."},
+        },
+        "required": ["query"],
+    }
+
+    def __init__(self, vector_memory: VectorMemory):
+        self.vector_memory = vector_memory
+
+    def run(self, query: str, k: int = 5) -> Any:
+        try:
+            if not query or not query.strip():
+                return {"error": "A search query is required."}
+            return {"results": self.vector_memory.search(query.strip(), k=max(1, int(k)))}
+        except Exception as exc:
+            return {"error": f"Knowledge-base search failed: {exc}"}
 
 
 def _sha256(path: Path) -> str:
@@ -157,4 +192,5 @@ def _nonnegative_int(value: Any, default: int) -> int:
 
 def register(confirm_fn=None) -> list[Tool]:
     _ = confirm_fn
-    return [KnowledgeBaseTool()]
+    ingest_tool = KnowledgeBaseTool()
+    return [ingest_tool, KnowledgeBaseSearchTool(ingest_tool.vector_memory)]

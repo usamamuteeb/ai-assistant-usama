@@ -3,6 +3,12 @@ anything else later — it should only ever call orchestrator.handle_message().
 """
 from __future__ import annotations
 
+import sys
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import argparse
 import uuid
 

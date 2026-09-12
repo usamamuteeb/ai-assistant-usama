@@ -49,6 +49,7 @@ def _orchestrator(results, tool_output=None):
             "min_tools": 1,
             "core_tools": set(),
         },
+        raw={},
         memory={"max_history_messages": 20},
     )
     instance.router = _ScriptedRouter(results)
@@ -70,6 +71,14 @@ def _tool_result(tool_id="tool-1", payload=None):
     return ChatResult(
         text="",
         tool_calls=[ToolCall(id=tool_id, name="fake_tool", input=payload or {"value": 1})],
+        model_used="fake:model",
+    )
+
+
+def _named_tool_result(name: str):
+    return ChatResult(
+        text="",
+        tool_calls=[ToolCall(id="tool-1", name=name, input={"prompt": "test"})],
         model_used="fake:model",
     )
 
@@ -124,6 +133,18 @@ def test_per_tool_watchdog_reports_timeout_without_blocking():
     assert result.text == "handled"
     second_request = assistant.router.calls[1]
     assert "did not respond within 0.01s" in str(second_request)
+
+
+def test_only_configured_slow_tool_gets_extended_watchdog():
+    assistant = _orchestrator([_named_tool_result("generate_image"), ChatResult(text="done")])
+    assistant._tool_executor = _TimeoutExecutor()
+    assistant.settings.raw = {"slow_tools": {"generate_image": {"max_seconds": 480}}}
+
+    result = assistant._run_tool_loop("free_api", [], assistant.tools.anthropic_tools())
+
+    assert result.text == "done"
+    assert "did not respond within 480s" in str(assistant.router.calls[1])
+    assert assistant._slow_tool_timeout_seconds("fake_tool") is None
 
 
 def test_last_model_and_images_are_isolated_per_session():

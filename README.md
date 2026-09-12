@@ -83,11 +83,33 @@ default audio output for assistant replies.
 
 ## Image generation
 
-The `generate_image` plugin uses Gemini's `gemini-3.1-flash-image` model to turn a
-text prompt into an image saved under `workspace/generated_images/`. Image generation
-depends on the model being enabled for your Google Cloud project and Gemini API key.
-If the first request returns an access or quota error, check the model access for your
-key at [Google AI Studio](https://aistudio.google.com/) before assuming the code is broken.
+The `generate_image` plugin saves images under `workspace/generated_images/`, which the
+web chat displays inline. It uses **local ComfyUI only**: no Gemini image model, cloud
+image API, or image credits are used.
+
+### Local ComfyUI setup (no cloud image credits)
+
+The first run of `python -m src.web_ui` automatically starts a project-local installer. It
+downloads official ComfyUI, a CPU-only Python runtime, and the default Stable Diffusion 1.5
+checkpoint under `data/comfyui`. This is a multi-GB, one-time download. Its progress is
+written to `data/comfyui/setup.log`; `data/comfyui/setup_status.json` records whether setup
+is running, ready, or failed. Once ready, later web-UI launches start ComfyUI in the
+background and connect to it at `http://127.0.0.1:8188`.
+
+The right-side **Image generation** card is the authoritative live status: it shows
+**Ready**, **Processing**, **Failed**, **Starting**, or **Not installed**, the current setup
+phase, timestamp, and the latest installer-log lines. Use **Retry image setup** there after
+a network failure; it starts the background installer and immediately returns control to the
+chat instead of making an assistant request wait.
+
+On this computer's Intel integrated graphics, generation runs in CPU mode. It is fully
+local but can take several minutes per 512×512 image. Leave the web UI open while a request
+is running. You can later install another compatible checkpoint in
+`data/comfyui/ComfyUI/models/checkpoints/` and update
+`image_generation.local_comfyui.checkpoint` in `config.yaml`.
+
+The local ComfyUI backend uses only stock ComfyUI nodes (checkpoint loader, text encoders,
+KSampler, VAE decode, and Save Image); no custom workflow or cloud account is required.
 
 ## Screen reading (OCR) setup
 

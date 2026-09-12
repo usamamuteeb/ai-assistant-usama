@@ -31,9 +31,17 @@ If asked what you can do, what features or tools you have, or similar meta-quest
 your own capabilities, answer directly from your knowledge of the tools available in this
 conversation. Do not call tools to answer capability questions. Only call tools when the
 user is asking you to actually do or look up something.
+Tools are either confirmation-gated or not. If a tool is available and is not confirmation-
+gated (most read actions and content-generation actions such as image generation are not),
+call it directly. Do not ask the user "shall I proceed?" before attempting it. Only the
+tool's own confirmation mechanism should ever pause for approval; never add an extra manual
+approval step on top of it.
 Only call a tool when it's necessary to directly fulfill what the user asked. Do not proactively
 call additional tools to gather extra context, verify assumptions, or check related information
 the user did not request — if something is ambiguous, ask the user instead of investigating via tools.
+For questions about documents already ingested into the knowledge base, use search_knowledge_base
+for semantic retrieval. Do not use filesystem tools to read or dump raw PDF bytes for a knowledge-
+base question unless the user explicitly asks for the document's raw contents or file operations.
 """
 
 MAX_TOOL_ITERATIONS = 10
@@ -154,9 +162,10 @@ class Orchestrator:
         called_tool_names: set[str] = set()
         last_model_used: str | None = None
         relevance_cfg = self.settings.tool_relevance_filter
+        loop_deadline = start + MAX_TOOL_LOOP_SECONDS
         for _ in range(MAX_TOOL_ITERATIONS):
             elapsed = time.monotonic() - start
-            if elapsed > MAX_TOOL_LOOP_SECONDS:
+            if elapsed > loop_deadline - start:
                 return ChatResult(
                     text=self._stopped_tool_loop_response(messages, elapsed_seconds=elapsed),
                     model_used=last_model_used,
@@ -170,6 +179,35 @@ class Orchestrator:
                     relevance_cfg["min_tools"],
                     relevance_cfg["core_tools"] | called_tool_names,
                 )
+                # Retrieval tools are deliberately one-shot per turn.  A
+                # model that keeps asking the same semantic search for slightly
+                # different ``k`` values can otherwise spend the entire wall
+                # clock budget retrieving the same document instead of
+                # answering from the results it already received.
+                selected_tools = [
+                    tool
+                    for tool in selected_tools
+                    if not (
+                        tool.get("name") in {"search_memory", "search_knowledge_base"}
+                        and tool.get("name") in called_tool_names
+                    )
+                ]
+                if "search_knowledge_base" in called_tool_names:
+                    # Once indexed retrieval has supplied document context,
+                    # keep the model from falling back to expensive/raw file
+                    # inspection tools in the answer-generation pass.
+                    selected_tools = [
+                        tool
+                        for tool in selected_tools
+                        if tool.get("name")
+                        not in {
+                            "filesystem",
+                            "search_files",
+                            "read_file_anywhere",
+                            "list_directory_anywhere",
+                            "search_memory",
+                        }
+                    ]
                 log_selection(relevance_context, tools, selected_tools)
             else:
                 selected_tools = tools
@@ -180,7 +218,7 @@ class Orchestrator:
                     messages,
                     tools=selected_tools,
                     system=SYSTEM_PROMPT,
-                    timeout_seconds=MAX_TOOL_LOOP_SECONDS - elapsed,
+                    timeout_seconds=max(1, loop_deadline - start - elapsed),
                     force_chain_start_index=force_chain_start_index,
                 )
                 last_model_used = result.model_used
@@ -215,6 +253,13 @@ class Orchestrator:
             tool_result_blocks = []
             confirmation_denied_action = None
             for tc in result.tool_calls:
+                slow_tool_timeout = self._slow_tool_timeout_seconds(tc.name)
+                tool_timeout = slow_tool_timeout or TOOL_CALL_HARD_TIMEOUT_SECONDS
+                # The model has now selected a known slow tool. Extend only
+                # this turn's deadline to that explicit tool budget; all
+                # unlisted tools remain constrained to the normal 45 seconds.
+                if slow_tool_timeout is not None:
+                    loop_deadline = max(loop_deadline, start + slow_tool_timeout)
                 try:
                     input_key: Any = frozenset(tc.input.items())
                 except TypeError:
@@ -225,12 +270,12 @@ class Orchestrator:
                 else:
                     future = self._tool_executor.submit(self.tools.call, tc.name, **tc.input)
                     try:
-                        output = future.result(timeout=TOOL_CALL_HARD_TIMEOUT_SECONDS)
+                        output = future.result(timeout=tool_timeout)
                     except concurrent.futures.TimeoutError:
                         output = {
                             "error": (
                                 f"Tool '{tc.name}' did not respond within "
-                                f"{TOOL_CALL_HARD_TIMEOUT_SECONDS}s and was abandoned. "
+                                f"{tool_timeout}s and was abandoned. "
                                 "It may still be running in the background."
                             )
                         }
@@ -266,6 +311,17 @@ class Orchestrator:
             messages.append({"role": "user", "content": tool_result_blocks})
 
         return ChatResult(text=self._stopped_tool_loop_response(messages), model_used=last_model_used)
+
+    def _slow_tool_timeout_seconds(self, tool_name: str) -> int | None:
+        """Return only an explicitly configured slow-tool budget, if any."""
+        slow_tools = self.settings.raw.get("slow_tools", {})
+        configured = slow_tools.get(tool_name, {}) if isinstance(slow_tools, dict) else {}
+        if not isinstance(configured, dict):
+            return None
+        try:
+            return max(1, int(configured["max_seconds"])) if "max_seconds" in configured else None
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _stopped_tool_loop_response(
