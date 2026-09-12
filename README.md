@@ -94,9 +94,10 @@ key at [Google AI Studio](https://aistudio.google.com/) before assuming the code
 Screen reading uses Tesseract OCR to capture and read visible text. Download and
 install Tesseract OCR for Windows from the UB-Mannheim build at
 https://github.com/UB-Mannheim/tesseract/wiki. If Tesseract is not on PATH after
-installation, set `pytesseract.pytesseract.tesseract_cmd` to the installed
-`tesseract.exe` path; this is the most common setup failure with pytesseract on
-Windows.
+installation, the screen-reader plugin automatically checks the standard Windows
+locations (`C:\Program Files\Tesseract-OCR\tesseract.exe` and the x86 equivalent).
+For a custom install location, set a `TESSERACT_CMD` environment variable to the
+full `tesseract.exe` path before starting the assistant.
 
 Captures and reads text from whatever is currently visible on the ENTIRE screen,
 not a specific app — the extracted text is sent to whichever model answers this request.
@@ -120,6 +121,25 @@ The `send_keystrokes_fallback` tool uses PyAutoGUI only as a fallback and target
 whichever window is currently focused. PyAutoGUI's failsafe remains enabled:
 drag the mouse pointer to any screen corner to abort an in-progress fallback
 action immediately.
+
+## Developer tools setup
+
+The `dev_tools` plugin can read, write, and delete files throughout the configured
+`dev_tools.allowed_root` (by default `C:\`, including Documents, Downloads, Pictures,
+and folders outside this project) and run arbitrary Python, JavaScript, or shell snippets.
+It rejects file and folder paths on other drives. The destructive actions (`write_file_anywhere`,
+`delete_file_anywhere`, and `run_code`) always use the browser's real manual
+approval dialog by default, even if the global approval mode is set to `auto`.
+
+`config.yaml` also contains `dev_tools.protected_path_prefixes`. It blocks writes
+and deletes below a small set of high-risk Windows paths before an approval prompt
+is shown. Both this blocklist and the confirmation override are adjustable safety
+rails, not a substitute for reviewing every requested action carefully.
+
+`run_code` is intentionally powerful: an approved arbitrary code snippet could access
+other drives on its own, so a path-root check cannot be a complete OS-level sandbox for
+that one tool. Keep its manual-confirmation override enabled; disable the tool rather than
+approving untrusted code if you need a strict machine-wide C:-only boundary.
 
 Force a tier for a single message:
 

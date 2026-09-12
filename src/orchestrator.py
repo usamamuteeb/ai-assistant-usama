@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
 import time
 from typing import Any, Optional
 
@@ -20,9 +21,12 @@ from .tools.registry import ToolRegistry, build_registry
 
 SYSTEM_PROMPT = """You are a personal AI assistant running locally on the user's machine.
 You have tools to read/write files in a sandboxed workspace, run shell commands (with the
-user's confirmation), and search long-term memory. Use tools when a task requires real
-action or information you don't already have. Be direct and concise. When you're not sure
-whether to act or ask, ask.
+user's confirmation), and search long-term memory. You also have developer tools for
+explicitly requested files and folders anywhere under C:\\ (for example Documents, Downloads,
+and Pictures), outside the project workspace. Use the developer tools for those C:\\ paths;
+they enforce their configured C:\\ root and require manual approval for write, delete, and
+code-execution actions. Use tools when a task requires real action or information you don't
+already have. Be direct and concise. When you're not sure whether to act or ask, ask.
 If asked what you can do, what features or tools you have, or similar meta-questions about
 your own capabilities, answer directly from your knowledge of the tools available in this
 conversation. Do not call tools to answer capability questions. Only call tools when the
@@ -35,6 +39,32 @@ the user did not request — if something is ambiguous, ask the user instead of 
 MAX_TOOL_ITERATIONS = 10
 MAX_TOOL_LOOP_SECONDS = 45
 TOOL_CALL_HARD_TIMEOUT_SECONDS = 150
+_IMAGE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.(?:png|jpe?g|gif|webp)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _image_paths_from_result(value: Any) -> list[str]:
+    """Find workspace-relative image paths in a tool result recursively."""
+    found: list[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, str):
+            for match in _IMAGE_PATH_RE.findall(item):
+                normalized = match.replace("\\", "/")
+                if not normalized.startswith(("/", "//")) and not re.match(r"^[A-Za-z]:/", normalized):
+                    if normalized not in found:
+                        found.append(normalized)
+        elif isinstance(item, dict):
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return found
 
 
 def _summarize_tool_result(value: Any, limit: int = 300) -> str:
@@ -55,6 +85,7 @@ class Orchestrator:
         self.tools: ToolRegistry = build_registry(settings, self.vector_memory, confirm_fn=confirm_fn)
         self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self._last_model_used: dict[str, str] = {}
+        self._last_images: dict[str, list[str]] = {}
         tool_schemas = self.tools.anthropic_tools()
         schema_tokens = sum(len(json.dumps(schema)) for schema in tool_schemas) // 4
         print(
@@ -70,6 +101,9 @@ class Orchestrator:
         force_chain_start_index: int | None = None,
     ) -> str:
         tier = force_tier or self.router.pick_tier(user_message)
+        # Image metadata is per-turn. Clear it before work so an exception or a
+        # tool-free response can never expose the previous turn's images.
+        self._last_images[session_id] = []
         self.store.log_model_call(tier, user_message)
         self.store.log_message(session_id, "user", user_message)
 
@@ -79,14 +113,17 @@ class Orchestrator:
         messages: list[dict[str, Any]] = [{"role": h["role"], "content": h["content"]} for h in history]
 
         anthropic_tools = self.tools.anthropic_tools()
+        image_paths: list[str] = []
         final_result = self._run_tool_loop(
             tier,
             messages,
             anthropic_tools,
             relevance_context=user_message,
             force_chain_start_index=force_chain_start_index,
+            image_paths=image_paths,
         )
         self._last_model_used[session_id] = final_result.model_used or "unknown"
+        self._last_images[session_id] = list(dict.fromkeys(image_paths))
         final_text = final_result.text
 
         self.store.log_message(session_id, "assistant", final_text)
@@ -100,6 +137,9 @@ class Orchestrator:
     def get_last_model_used(self, session_id: str) -> str | None:
         return self._last_model_used.get(session_id)
 
+    def get_last_images(self, session_id: str) -> list[str]:
+        return list(self._last_images.get(session_id, []))
+
     def _run_tool_loop(
         self,
         tier: str,
@@ -107,6 +147,7 @@ class Orchestrator:
         tools: list[dict[str, Any]],
         relevance_context: str = "",
         force_chain_start_index: int | None = None,
+        image_paths: list[str] | None = None,
     ) -> ChatResult:
         start = time.monotonic()
         executed_results: dict[tuple[str, Any], str] = {}
@@ -195,6 +236,8 @@ class Orchestrator:
                         }
                     output_str = str(output)
                     executed_results[cache_key] = output_str
+                if image_paths is not None:
+                    image_paths.extend(_image_paths_from_result(output_str))
                 if len(output_str) > 4000:
                     output_str = output_str[:4000] + "... [truncated]"
                 called_tool_names.add(tc.name)

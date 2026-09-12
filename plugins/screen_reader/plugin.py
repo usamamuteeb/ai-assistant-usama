@@ -1,6 +1,10 @@
 """Read visible text from the entire screen using local OCR."""
 from __future__ import annotations
 
+import os
+import platform
+import shutil
+from pathlib import Path
 from typing import Any
 
 from src.tools.base import Tool
@@ -14,6 +18,24 @@ except ImportError as exc:  # pragma: no cover - dependency is declared in requi
     _OCR_IMPORT_ERROR = str(exc)
 else:
     try:
+        _configured_tesseract = os.getenv("TESSERACT_CMD")
+        _candidates = [
+            _configured_tesseract,
+            shutil.which("tesseract"),
+        ]
+        if platform.system() == "Windows":
+            _candidates.extend(
+                [
+                    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                ]
+            )
+        _tesseract_path = next(
+            (Path(candidate) for candidate in _candidates if candidate and Path(candidate).is_file()),
+            None,
+        )
+        if _tesseract_path is not None:
+            pytesseract.pytesseract.tesseract_cmd = str(_tesseract_path)
         pytesseract.get_tesseract_version()
     except Exception as exc:
         _OCR_IMPORT_ERROR = str(exc)

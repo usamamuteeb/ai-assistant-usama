@@ -10,10 +10,12 @@ import re
 import socket
 import sys
 import threading
+import time
 import traceback
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -64,6 +66,8 @@ _pending_lock = threading.Lock()
 _session_confirm_fns: dict[str, Any] = {}
 _approval_modes: dict[str, str] = {}
 _last_confirmation_results: dict[str, bool] = {}
+_activity_by_session: dict[str, list[dict[str, str]]] = {}
+_activity_lock = threading.Lock()
 _active_session_id: str | None = None
 _active_request_task: asyncio.Task[str] | None = None
 
@@ -73,6 +77,10 @@ _ui_settings = load_settings()
 _browser_screenshots_dir = _ui_settings.workspace_root() / "screenshots"
 _browser_screenshots_dir.mkdir(parents=True, exist_ok=True)
 app.add_static_files("/browser-screenshots", _browser_screenshots_dir)
+_generated_images_dir = _ui_settings.workspace_root() / "generated_images"
+_generated_images_dir.mkdir(parents=True, exist_ok=True)
+app.add_static_files("/generated-images", _generated_images_dir)
+app.add_static_files("/screenshots", _browser_screenshots_dir)
 
 
 def _model_label(provider: str, model: str) -> str:
@@ -91,6 +99,30 @@ if _ui_settings.routing.get("allow_premium", True):
 _LEGACY_SCREENSHOT_MARKDOWN = re.compile(
     r"(!\[[^\]]*\]\()\s*(?:\./)?workspace/screenshots/([^\s)]+)(\))"
 )
+
+
+def _record_activity(session_id: str, status: str, title: str, detail: str = "") -> None:
+    """Store a small, thread-safe execution event for that browser session."""
+    event = {
+        "time": time.strftime("%H:%M:%S"),
+        "status": status,
+        "title": title,
+        "detail": detail,
+    }
+    with _activity_lock:
+        events = _activity_by_session.setdefault(session_id, [])
+        events.append(event)
+        del events[:-40]
+
+
+def _clear_activity(session_id: str) -> None:
+    with _activity_lock:
+        _activity_by_session[session_id] = []
+
+
+def _activity_snapshot(session_id: str) -> list[dict[str, str]]:
+    with _activity_lock:
+        return [dict(event) for event in _activity_by_session.get(session_id, [])]
 
 
 def _surface_confirmation_notification() -> None:
@@ -157,17 +189,25 @@ def _surface_confirmation_notification() -> None:
 
 def _confirm_for_session(session_id: str, command: str, *, force_manual: bool = False) -> bool:
     if not force_manual and _approval_modes.get(session_id, "auto") == "auto":
+        _record_activity(session_id, "done", "Action approved automatically", command)
         return True
     event = threading.Event()
     pending = {"command": command, "event": event, "result": None, "shown": False}
     with _pending_lock:
         _pending_confirmations[session_id] = pending
+    _record_activity(session_id, "waiting", "Waiting for your approval", command)
     _surface_confirmation_notification()
     event.wait()
     with _pending_lock:
         result = _pending_confirmations.get(session_id, pending).get("result")
         _pending_confirmations.pop(session_id, None)
         _last_confirmation_results[session_id] = bool(result)
+    _record_activity(
+        session_id,
+        "done" if result else "error",
+        "Action approved" if result else "Action denied",
+        command,
+    )
     return bool(result)
 
 
@@ -201,6 +241,28 @@ _dispatch_confirm.manual_confirm = _dispatch_manual_confirm
 # Keep one long-lived orchestrator for its SQLite/vector/tool resources.
 orchestrator = Orchestrator(_ui_settings, confirm_fn=_dispatch_confirm)
 
+# The registry is the single execution boundary used by the orchestrator.  Wrap
+# its already-bound dispatcher here (rather than changing the orchestrator
+# contract) so the NiceGUI client can show actual tool starts and finishes.
+_registry_call = orchestrator.tools.call
+
+
+def _tracked_tool_call(name: str, **kwargs: Any) -> Any:
+    session_id = _active_session_id
+    if session_id:
+        inputs = ", ".join(sorted(kwargs)) or "no inputs"
+        _record_activity(session_id, "active", f"Running tool: {name}", f"Inputs: {inputs}.")
+    result = _registry_call(name, **kwargs)
+    if session_id:
+        if isinstance(result, dict) and result.get("error"):
+            _record_activity(session_id, "error", f"Tool failed: {name}", str(result["error"]))
+        else:
+            _record_activity(session_id, "done", f"Tool finished: {name}", "Completed successfully.")
+    return result
+
+
+orchestrator.tools.call = _tracked_tool_call
+
 
 def _selection_args(selection: str) -> tuple[str | None, int | None]:
     if selection == "auto":
@@ -216,7 +278,29 @@ def _selection_args(selection: str) -> tuple[str | None, int | None]:
 
 def _chat_markdown(content: str) -> str:
     """Map legacy browser-screenshot paths to the local static-file route."""
-    return _LEGACY_SCREENSHOT_MARKDOWN.sub(r"\1/browser-screenshots/\2\3", content)
+    return _LEGACY_SCREENSHOT_MARKDOWN.sub(r"\1/screenshots/\2\3", content)
+
+
+def _static_image_url(path: str) -> str | None:
+    """Map only known workspace image subfolders to their dedicated URL routes."""
+    normalized = str(path).replace("\\", "/").lstrip("./")
+    for folder, route in (("generated_images", "/generated-images"), ("screenshots", "/screenshots")):
+        marker = f"/{folder}/"
+        start = normalized.find(marker)
+        if start < 0:
+            if normalized.startswith(f"{folder}/"):
+                start = -1
+                filename = normalized[len(folder) + 1 :]
+            else:
+                continue
+        else:
+            filename = normalized[start + len(marker) :]
+        if not filename or "/" in filename or filename in {".", ".."} or ".." in filename:
+            continue
+        if not re.search(r"\.(?:png|jpe?g|gif|webp)$", filename, re.IGNORECASE):
+            continue
+        return f"{route}/{quote(filename)}"
+    return None
 
 
 def _clear_finished_request(task: asyncio.Task[str]) -> None:
@@ -250,7 +334,7 @@ def _available_port(start: int = 8080) -> int:
     raise RuntimeError(f"No available port found in range {start}-{start + 99}")
 
 
-def _render_history(chat_log: ui.column, history: list[dict[str, str]]) -> None:
+def _render_history(chat_log: ui.column, history: list[dict[str, Any]]) -> None:
     chat_log.clear()
     with chat_log:
         if not history:
@@ -269,6 +353,12 @@ def _render_history(chat_log: ui.column, history: list[dict[str, str]]) -> None:
                 ui.markdown(_chat_markdown(entry["content"])).classes("chat-markdown")
                 if not sent and entry.get("model_used"):
                     ui.label(f"via {entry['model_used']}").classes("model-used-caption")
+                if not sent:
+                    for image_path in entry.get("images", []):
+                        image_url = _static_image_url(image_path)
+                        if image_url:
+                            with ui.link("", image_url, new_tab=True).classes("chat-image-link"):
+                                ui.image(image_url).classes("chat-image")
 
 
 def _show_confirmation(session_id: str, dialog_holder: dict[str, Any]) -> None:
@@ -319,7 +409,9 @@ def main() -> None:
     ui.add_css("""
         :root { color-scheme: dark; --ink: #f8fafc; --muted: #a8afb9; --panel: #1a1b1e; --panel-2: #222326; --line: rgba(255,255,255,.08); --crimson: #d1202c; }
         body, .q-page, .q-page-container, .q-layout { background: radial-gradient(circle at 78% -18%, rgba(120, 18, 28, .23), transparent 30rem), #111214; color: var(--ink); }
-        .q-drawer { background: linear-gradient(180deg, #1f2023 0%, #18191c 100%); border-right: 1px solid rgba(209,32,44,.30); box-shadow: 16px 0 40px rgba(0,0,0,.26); }
+        .q-drawer { background: linear-gradient(180deg, #1f2023 0%, #18191c 100%); box-shadow: 16px 0 40px rgba(0,0,0,.26); }
+        .assistant-sidebar { border-right: 1px solid rgba(209,32,44,.30); }
+        .assistant-activity-drawer { border-left: 1px solid rgba(209,32,44,.30); box-shadow: -16px 0 40px rgba(0,0,0,.26); }
         .assistant-sidebar { height: 100%; }
         .assistant-brand { gap: .8rem; margin: .35rem 0 1.75rem; }
         .assistant-brand-mark { width: 42px; height: 42px; border-radius: 13px; display: flex; align-items: center; justify-content: center; color: #fff; background: linear-gradient(145deg, #ef3340, #8f101b); box-shadow: 0 10px 24px rgba(209,32,44,.25); }
@@ -335,12 +427,12 @@ def main() -> None:
         .assistant-tier .q-field__native, .assistant-tier .q-field__label, .assistant-tier .q-field__marginal { color: #f3f4f6 !important; }
         .sidebar-footer { margin-top: auto; padding: 1rem; border: 1px solid rgba(209,32,44,.18); border-radius: 12px; background: rgba(209,32,44,.06); }
         .sidebar-footer-title { margin-bottom: .28rem; color: #fff; font-size: .8rem; font-weight: 700; }
-        .assistant-header { width: min(980px, calc(100vw - 23rem)); margin: 1.6rem auto .45rem; padding: 0 .25rem; }
+        .assistant-header { width: min(860px, calc(100vw - 40rem)); margin: 1.6rem auto .45rem; padding: 0 .25rem; }
         .assistant-header-icon { color: #ff4d57; font-size: 1.55rem; }
         .assistant-title { color: #fff; font-size: 1.55rem; font-weight: 750; letter-spacing: -.035em; line-height: 1.15; }
         .assistant-status { padding: .36rem .62rem; border: 1px solid rgba(105, 223, 153, .24); border-radius: 999px; color: #9ce3ba; background: rgba(74, 222, 128, .08); font-size: .68rem; font-weight: 700; letter-spacing: .07em; }
         .assistant-status-dot { color: #5ee28b; font-size: .62rem; }
-        .assistant-chat { width: min(980px, calc(100vw - 23rem)); height: calc(100vh - 13.4rem); margin: 0 auto; padding: 1.2rem .25rem 8rem; overflow-y: auto; gap: 1.15rem; }
+        .assistant-chat { width: min(860px, calc(100vw - 40rem)); height: calc(100vh - 13.4rem); margin: 0 auto; padding: 1.2rem .25rem 8rem; overflow-y: auto; gap: 1.15rem; }
         .assistant-chat::-webkit-scrollbar { width: 8px; }
         .assistant-chat::-webkit-scrollbar-thumb { background: #3b3d42; border-radius: 999px; }
         .assistant-empty { align-self: center; width: min(420px, 100%); margin: auto; padding: 2.5rem 2rem; border: 1px solid var(--line); border-radius: 18px; background: linear-gradient(145deg, rgba(38,39,43,.88), rgba(27,28,31,.88)); text-align: center; box-shadow: 0 18px 45px rgba(0,0,0,.16); }
@@ -353,6 +445,8 @@ def main() -> None:
         .assistant-message .q-message-text { width: fit-content !important; max-width: 76% !important; min-width: 122px; margin: 0; word-break: normal; overflow-wrap: anywhere; }
         .assistant-message .q-message-text-content { width: 100%; padding: .9rem 1rem; border-radius: 14px; box-shadow: 0 8px 20px rgba(0,0,0,.14); }
         .model-used-caption { margin: .35rem 0 0 .25rem; color: #858b96; font-size: .68rem; }
+        .chat-image-link { display: block; width: fit-content; max-width: 400px; margin: .85rem 0 .2rem .25rem; }
+        .chat-image { display: block; max-width: min(400px, 100%); max-height: 420px; border: 1px solid rgba(209,32,44,.3); border-radius: 12px; object-fit: contain; box-shadow: 0 10px 24px rgba(0,0,0,.24); }
         .message-user .q-message-text, .message-user .q-message-text--sent, .message-user .q-message-text-content, .message-user .q-message-text-content--sent { background: linear-gradient(145deg, #56191e, #3b1115) !important; color: #fff !important; }
         .message-assistant .q-message-text, .message-assistant .q-message-text--received, .message-assistant .q-message-text-content, .message-assistant .q-message-text-content--received { background: #24262a !important; color: #f5f6f8 !important; }
         .message-assistant .q-message-text { width: min(76%, 780px) !important; min-width: 190px; border: 1px solid rgba(255,255,255,.055); }
@@ -372,8 +466,8 @@ def main() -> None:
         .chat-markdown tr:last-child td { border-bottom: 0; }
         .chat-markdown th { background: #591d22; color: #fff; font-size: .78rem; }
         .chat-markdown td { background: rgba(255,255,255,.015); }
-        .assistant-input { position: fixed; bottom: 0; left: 20rem; right: 0; z-index: 10; padding: .85rem 1.5rem .9rem; background: rgba(23,24,27,.96); border-top: 1px solid rgba(209,32,44,.3); box-shadow: 0 -12px 30px rgba(0,0,0,.22); backdrop-filter: blur(18px); }
-        .assistant-compose-inner { width: min(980px, 100%); margin: 0 auto; gap: .38rem; }
+        .assistant-input { position: fixed; bottom: 0; left: 300px; right: 300px; z-index: 10; padding: .85rem 1.1rem .9rem; background: rgba(23,24,27,.96); border-top: 1px solid rgba(209,32,44,.3); box-shadow: 0 -12px 30px rgba(0,0,0,.22); backdrop-filter: blur(18px); }
+        .assistant-compose-inner { width: min(860px, 100%); margin: 0 auto; gap: .38rem; }
         .assistant-compose-row { width: 100%; gap: .7rem; }
         .assistant-compose-icon { margin-left: .25rem; color: #d1202c; }
         .assistant-input-field { background: #292a2e; border-radius: 11px; }
@@ -384,7 +478,32 @@ def main() -> None:
         .assistant-send { min-height: 50px; min-width: 108px; padding: 0 1.1rem; border-radius: 10px; color: #fff !important; font-weight: 700; letter-spacing: .01em; }
         .voice-input-button { min-height: 50px; min-width: 50px; color: #cdd2da; }
         .voice-input-button.voice-recording { color: #ff5963; background: rgba(209,32,44,.18); }
+        .knowledge-base { margin-top: 1.25rem; padding-top: .15rem; }
+        .knowledge-upload { width: 100%; border: 1px dashed rgba(209,32,44,.5); border-radius: 10px; background: rgba(209,32,44,.06); }
+        .knowledge-upload .q-uploader__header { background: linear-gradient(135deg, #9e1822, #6d1018); }
+        .knowledge-file-list { width: 100%; gap: .35rem; margin-top: .55rem; }
+        .knowledge-file { width: 100%; padding: .35rem .45rem; border-radius: 7px; background: rgba(255,255,255,.035); color: #d9dde4; font-size: .75rem; }
+        .knowledge-file .q-icon { color: #65d993; font-size: 1rem; }
+        .knowledge-reindex { width: 100%; margin-top: .7rem; }
         .compose-helper { padding-left: 2rem; }
+        .activity-header { width: 100%; padding: .35rem 0 .9rem; border-bottom: 1px solid var(--line); }
+        .activity-title { color: #fff; font-size: .93rem; font-weight: 750; }
+        .activity-copy { margin-top: .24rem; color: var(--muted); font-size: .73rem; line-height: 1.42; }
+        .activity-live { padding: .25rem .45rem; border: 1px solid rgba(105,223,153,.22); border-radius: 999px; color: #9ce3ba; background: rgba(74,222,128,.08); font-size: .62rem; font-weight: 750; letter-spacing: .07em; }
+        .activity-feed { width: 100%; gap: .65rem; padding: 1rem 0; overflow-y: auto; }
+        .activity-empty { padding: 1rem .2rem; color: var(--muted); font-size: .78rem; line-height: 1.5; }
+        .activity-event { width: 100%; gap: .65rem; padding: .7rem; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.025); }
+        .activity-event-icon { margin-top: .05rem; font-size: 1rem; }
+        .activity-event-active .activity-event-icon { color: #f2c94c; }
+        .activity-event-waiting { border-color: rgba(242,201,76,.34); background: rgba(242,201,76,.06); }
+        .activity-event-waiting .activity-event-icon { color: #f2c94c; }
+        .activity-event-done .activity-event-icon { color: #65d993; }
+        .activity-event-error { border-color: rgba(255,89,99,.26); background: rgba(209,32,44,.06); }
+        .activity-event-error .activity-event-icon { color: #ff6670; }
+        .activity-event-title { color: #f1f3f5; font-size: .77rem; font-weight: 700; line-height: 1.35; }
+        .activity-event-detail { margin-top: .18rem; color: #aeb5c0; font-size: .7rem; line-height: 1.42; overflow-wrap: anywhere; }
+        .activity-event-time { color: #747b86; font-size: .62rem; white-space: nowrap; }
+        .activity-clear { margin-top: auto; width: 100%; color: #b8bec7; }
         @media (max-width: 900px) {
             .assistant-header, .assistant-chat { width: calc(100vw - 2rem); }
             .assistant-header { margin-top: 1rem; }
@@ -392,9 +511,75 @@ def main() -> None:
             .assistant-input { left: 0; padding: .75rem 1rem; }
             .assistant-message .q-message-text, .message-assistant .q-message-text { max-width: 88% !important; }
         }
+        @media (max-width: 1200px) and (min-width: 901px) {
+            .assistant-header, .assistant-chat { width: min(760px, calc(100vw - 40rem)); }
+        }
     """)
 
-    with ui.left_drawer(value=True).props("behavior=desktop width=320").classes("p-5 assistant-sidebar"):
+    knowledge_base_dir = _ui_settings.workspace_root() / "knowledge_base"
+    knowledge_base_dir.mkdir(parents=True, exist_ok=True)
+
+    def indexed_knowledge_files() -> list[str]:
+        state = orchestrator.store.get_state("kb_file_hashes", {})
+        return sorted(state.keys()) if isinstance(state, dict) else []
+
+    async def save_knowledge_file(event: Any) -> None:
+        original_name = str(getattr(event.file, "name", "document"))
+        filename = Path(original_name).name
+        if Path(filename).suffix.lower() not in {".pdf", ".txt", ".md"}:
+            ui.notify("Only PDF, TXT, and Markdown files are supported.", type="negative")
+            return
+        try:
+            await event.file.save(str(knowledge_base_dir / filename))
+            ui.notify(
+                f"Saved {filename} — click Re-index to add it to the knowledge base.",
+                type="positive",
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            ui.notify(f"Could not save {filename}: {exc}", type="negative")
+
+    reindex_state = {"busy": False}
+
+    async def reindex_knowledge_base() -> None:
+        if reindex_state["busy"]:
+            return
+        reindex_state["busy"] = True
+        reindex_button.disable()
+        reindex_spinner.set_visibility(True)
+        try:
+            result = await run.io_bound(orchestrator.tools.call, "ingest_knowledge_base")
+            if not isinstance(result, dict) or result.get("error"):
+                ui.notify(str(result.get("error", result)), type="negative")
+            else:
+                ingested = len(result.get("ingested_files", []))
+                chunks = result.get("total_chunks_added", 0)
+                skipped = len(result.get("skipped_unchanged", []))
+                ui.notify(
+                    f"Ingested {ingested} new files, {chunks} chunks added, {skipped} unchanged skipped.",
+                    type="positive",
+                )
+                refresh_knowledge_file_list()
+        except Exception as exc:
+            traceback.print_exc()
+            ui.notify(f"Knowledge-base re-index failed: {exc}", type="negative")
+        finally:
+            reindex_state["busy"] = False
+            reindex_spinner.set_visibility(False)
+            reindex_button.enable()
+
+    def refresh_knowledge_file_list() -> None:
+        knowledge_file_list.clear()
+        with knowledge_file_list:
+            files = indexed_knowledge_files()
+            if not files:
+                ui.label("No indexed documents yet.").classes("setting-copy")
+            for filename in files:
+                with ui.row().classes("knowledge-file items-center no-wrap"):
+                    ui.icon("check_circle")
+                    ui.label(filename).classes("ellipsis")
+
+    with ui.left_drawer(value=True).props("behavior=desktop width=300").classes("p-5 assistant-sidebar"):
         with ui.row().classes("assistant-brand items-center no-wrap"):
             with ui.element("div").classes("assistant-brand-mark"):
                 ui.icon("auto_awesome")
@@ -419,9 +604,72 @@ def main() -> None:
             value=client["read_replies_aloud"],
             on_change=lambda e: client.__setitem__("read_replies_aloud", e.value),
         ).classes("voice-output-toggle")
+        with ui.column().classes("knowledge-base"):
+            ui.label("Knowledge Base").classes("sidebar-section-label")
+            ui.label("Upload documents for local semantic search.").classes("setting-copy")
+            ui.upload(
+                on_upload=save_knowledge_file,
+                auto_upload=True,
+            ).props('accept=".pdf,.txt,.md"').classes("knowledge-upload")
+            knowledge_file_list = ui.column().classes("knowledge-file-list")
+            refresh_knowledge_file_list()
+            with ui.row().classes("items-center no-wrap w-full"):
+                reindex_button = ui.button(
+                    "Re-index Knowledge Base",
+                    icon="sync",
+                    color="primary",
+                    on_click=reindex_knowledge_base,
+                ).classes("knowledge-reindex")
+                reindex_spinner = ui.spinner("dots", size="sm", color="primary")
+                reindex_spinner.set_visibility(False)
         with ui.column().classes("sidebar-footer"):
             ui.label("Private by design").classes("sidebar-footer-title")
             ui.label("Your chat stays in this local assistant session.").classes("sidebar-footer-copy")
+
+    activity_render_state = {"signature": ""}
+
+    def render_activity() -> None:
+        """Refresh only when the background worker has recorded a new event."""
+        events = _activity_snapshot(session_id)
+        signature = repr(events)
+        if signature == activity_render_state["signature"]:
+            return
+        activity_render_state["signature"] = signature
+        activity_feed.clear()
+        with activity_feed:
+            if not events:
+                ui.label("No activity yet. Assistant decisions, tool approvals, and request completion will appear here.").classes("activity-empty")
+                return
+            icon_for_status = {
+                "active": "hourglass_top",
+                "waiting": "pending_actions",
+                "done": "check_circle",
+                "error": "error_outline",
+            }
+            for event in reversed(events):
+                status = event["status"]
+                with ui.row().classes(f"activity-event activity-event-{status} no-wrap"):
+                    ui.icon(icon_for_status.get(status, "info")).classes("activity-event-icon")
+                    with ui.column().classes("gap-0 flex-grow"):
+                        ui.label(event["title"]).classes("activity-event-title")
+                        if event["detail"]:
+                            ui.label(event["detail"][:240]).classes("activity-event-detail")
+                    ui.label(event["time"]).classes("activity-event-time")
+
+    def clear_activity_feed() -> None:
+        _clear_activity(session_id)
+        render_activity()
+
+    with ui.right_drawer(value=True).props("behavior=desktop width=300").classes("p-5 assistant-activity-drawer"):
+        with ui.row().classes("activity-header items-start no-wrap"):
+            with ui.column().classes("gap-0"):
+                ui.label("Live activity").classes("activity-title")
+                ui.label("Real-time assistant and tool progress").classes("activity-copy")
+            ui.space()
+            ui.label("LIVE").classes("activity-live")
+        activity_feed = ui.column().classes("activity-feed")
+        ui.button("Clear activity", icon="cleaning_services", on_click=clear_activity_feed).props("flat no-caps").classes("activity-clear")
+        render_activity()
 
     with ui.row().classes("assistant-header items-center no-wrap"):
         ui.icon("smart_toy").classes("assistant-header-icon")
@@ -467,6 +715,9 @@ def main() -> None:
         history = client["chat_history"]
         history.append({"role": "user", "content": user_message})
         _render_history(chat_log, history)
+        _clear_activity(session_id)
+        _record_activity(session_id, "active", "Request started", "Sending your message to the assistant.")
+        _record_activity(session_id, "active", "Assistant is thinking", "Selecting a model and deciding whether tools are needed.")
         try:
             _active_session_id = session_id
             task = asyncio.create_task(
@@ -483,6 +734,12 @@ def main() -> None:
             try:
                 reply = await asyncio.wait_for(asyncio.shield(task), timeout=REQUEST_UI_TIMEOUT_SECONDS)
             except TimeoutError:
+                _record_activity(
+                    session_id,
+                    "waiting",
+                    "Request is still running",
+                    "The worker is continuing in the background; new requests remain blocked until it finishes.",
+                )
                 reply = (
                     "[error] This request is taking longer than 90 seconds and is still running. "
                     "The input is available again, but new requests are held until this one finishes; do not retry it yet."
@@ -494,9 +751,22 @@ def main() -> None:
                 reply = "Command denied by user."
         except Exception as exc:
             traceback.print_exc()
+            _record_activity(session_id, "error", "Request failed", str(exc))
             reply = f"[error] {exc}"
         model_used = orchestrator.get_last_model_used(session_id)
-        history.append({"role": "assistant", "content": reply, "model_used": model_used})
+        if not reply.startswith("[error]"):
+            _record_activity(
+                session_id,
+                "done",
+                "Assistant reply received",
+                f"Completed via {model_used}." if model_used else "Completed without a model response label.",
+            )
+        history.append({
+            "role": "assistant",
+            "content": reply,
+            "model_used": model_used,
+            "images": orchestrator.get_last_images(session_id),
+        })
         _render_history(chat_log, history)
         if client["read_replies_aloud"] and not reply.startswith("[error]"):
             await run.io_bound(speak_text, reply)
@@ -519,7 +789,11 @@ def main() -> None:
                 ui.button("Send", on_click=send_message, icon="send", color="primary").classes("assistant-send")
             ui.label("Enter to send · Tool approvals appear here when needed").classes("compose-helper")
 
-    ui.timer(0.3, lambda: _show_confirmation(session_id, dialog_holder))
+    def refresh_live_ui() -> None:
+        _show_confirmation(session_id, dialog_holder)
+        render_activity()
+
+    ui.timer(0.3, refresh_live_ui)
 
 
 if __name__ in {"__main__", "__mp_main__"}:

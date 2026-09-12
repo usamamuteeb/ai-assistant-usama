@@ -80,6 +80,19 @@ windows_control:
   # when the global approval mode is set to auto.
   force_manual_confirmation: true
 
+dev_tools:
+  # The path-oriented developer tools can work anywhere beneath this root,
+  # including Documents, Downloads, Pictures, and other folders outside this project.
+  allowed_root: 'C:\'
+  # Write/delete/code execution use the browser's real manual-confirmation path
+  # even when the global UI approval mode is set to auto.
+  force_manual_confirmation: true
+  protected_path_prefixes:
+    - 'C:\Windows'
+    - 'C:\Program Files'
+    - 'C:\Program Files (x86)'
+    - 'C:\Users\HP\AppData'
+
 google_workspace:
   credentials_path: credentials.json   # downloaded from Google Cloud Console project root
   scopes:
@@ -87,11 +100,20 @@ google_workspace:
     - gmail.send
     - calendar
 
+knowledge_base:
+  folder: knowledge_base               # relative to workspace root
+  chroma_collection: assistant_knowledge_base
+  chunk_size: 1400
+  chunk_overlap: 180
+
 scheduled_tasks:
-  # Example only — edit or remove. Each entry fires the orchestrator headlessly on a cron schedule.
-  # cron fields: minute hour day month day_of_week (standard cron syntax)
-  - name: daily_summary_example
+  - name: daily_briefing
     cron: "0 8 * * *"
-    prompt: "Summarize anything new in the workspace folder and note it in memory."
-    tier: local
-    enabled: false
+    prompt: >
+      Give me my daily briefing: list today's calendar events, summarize how
+      many unread emails I have and flag any that look urgent, and report
+      current CPU/memory/disk usage. Write the full briefing as a formatted
+      markdown file to briefings/<today's date>.md in the workspace, then
+      just reply with a short confirmation that it's done.
+    tier: free_api
+    enabled: true

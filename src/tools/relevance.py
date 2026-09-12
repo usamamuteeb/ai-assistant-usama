@@ -38,8 +38,11 @@ def select_relevant_tools(
             all_tools.index(tool),
         ),
     )
-    target_count = max(max_tools, max(0, min_tools - len(core)))
-    selected = core + ranked[:target_count]
+    # Core tools are mandatory, while non-core tools fill the configured floor
+    # without allowing the total selection to exceed max_tools.
+    target_total = min(max_tools, max(min_tools, len(core)))
+    remaining_slots = max(0, target_total - len(core))
+    selected = core + ranked[:remaining_slots]
     selected_names = {id(tool) for tool in selected}
     return [tool for tool in all_tools if id(tool) in selected_names]
 
