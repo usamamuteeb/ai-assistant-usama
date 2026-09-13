@@ -36,7 +36,7 @@ except ImportError:  # optional until requirements are installed
 
 from src.config import load_settings
 from src.orchestrator import Orchestrator
-from src.voice import speak_text, transcribe_audio
+from src.voice import speak_text, speech_text, stop_speaking, transcribe_audio
 
 APPROVAL_MODES = ["manual", "auto"]
 PAGE_TITLE = "Personal AI Assistant"
@@ -44,33 +44,179 @@ PAGE_TITLE = "Personal AI Assistant"
 # worker continues after this UI handoff and replaces its pending chat bubble
 # when it finishes.
 REQUEST_UI_TIMEOUT_SECONDS = 20
-VOICE_RECORD_JS = """
+VOICE_CAPTURE_JS = """
 async (event) => {
     const button = event.currentTarget;
-    if (window.__assistantVoiceRecorder) {
-        window.__assistantVoiceRecorder.stop();
+    if (window.__neuralVoiceCapture) {
+        window.__neuralVoiceCapture.stop();
         return;
     }
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+    const emitVoice = (phase, text = '', payload = '', error = '') => emit({phase, text, payload, error});
+    const startLocalRecorder = (stream) => {
         const recorder = new MediaRecorder(stream);
         const chunks = [];
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const analyser = audioContext.createAnalyser();
+        const source = audioContext.createMediaStreamSource(stream);
+        const samples = new Uint8Array(analyser.fftSize);
+        let lastSpeechAt = performance.now();
+        source.connect(analyser);
+        const silenceTimer = window.setInterval(() => {
+            analyser.getByteTimeDomainData(samples);
+            let total = 0;
+            for (const sample of samples) total += Math.abs(sample - 128);
+            if (total / samples.length > 3) lastSpeechAt = performance.now();
+            if (performance.now() - lastSpeechAt > 1800 && recorder.state === 'recording') recorder.stop();
+        }, 180);
         recorder.ondataavailable = (recordedEvent) => {
             if (recordedEvent.data.size > 0) chunks.push(recordedEvent.data);
         };
         recorder.onstop = () => {
             stream.getTracks().forEach((track) => track.stop());
-            window.__assistantVoiceRecorder = null;
+            window.clearInterval(silenceTimer);
+            source.disconnect();
+            audioContext.close();
+            window.__neuralVoiceCapture = null;
             button.classList.remove('voice-recording');
             const reader = new FileReader();
-            reader.onloadend = () => emit(reader.result.split(',')[1] || '');
+            reader.onloadend = () => emitVoice('audio', '', reader.result.split(',')[1] || '');
             reader.readAsDataURL(new Blob(chunks, {type: recorder.mimeType || 'audio/webm'}));
         };
-        window.__assistantVoiceRecorder = recorder;
+        window.__neuralVoiceCapture = {stop: () => recorder.stop()};
         button.classList.add('voice-recording');
+        emitVoice('listening');
         recorder.start();
+        window.setTimeout(() => window.__neuralVoiceCapture?.stop(), 20000);
+    };
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+        const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (Recognition) {
+            stream.getTracks().forEach((track) => track.stop());
+            const recognition = new Recognition();
+            let finalText = '';
+            let stopped = false;
+            recognition.continuous = false;
+            recognition.interimResults = true;
+            recognition.lang = navigator.language || 'en-US';
+            recognition.onstart = () => {
+                button.classList.add('voice-recording');
+                emitVoice('listening');
+            };
+            recognition.onresult = (resultEvent) => {
+                let interim = '';
+                for (let index = resultEvent.resultIndex; index < resultEvent.results.length; index++) {
+                    const text = resultEvent.results[index][0].transcript;
+                    if (resultEvent.results[index].isFinal) finalText += `${text} `;
+                    else interim += text;
+                }
+                emitVoice('partial', (finalText + interim).trim());
+            };
+            recognition.onerror = async (errorEvent) => {
+                const error = errorEvent.error || 'Speech recognition failed.';
+                if (error === 'network') {
+                    // Chromium recognition is often cloud-backed. Preserve a
+                    // useful mic experience by falling back to local Whisper.
+                    try {
+                        recognition.onend = null;
+                        window.__neuralVoiceCapture = null;
+                        button.classList.remove('voice-recording');
+                        startLocalRecorder(await navigator.mediaDevices.getUserMedia({audio: true}));
+                    } catch (_) {
+                        emitVoice('error', '', '', 'Browser recognition failed and local microphone recording could not start.');
+                    }
+                    return;
+                }
+                emitVoice('error', '', '', error);
+            };
+            recognition.onend = () => {
+                button.classList.remove('voice-recording');
+                window.__neuralVoiceCapture = null;
+                const transcript = finalText.trim();
+                emitVoice(transcript ? 'final' : (stopped ? 'cancelled' : 'stopped'), transcript);
+            };
+            recognition.start();
+            window.__neuralVoiceCapture = {stop: () => { stopped = true; recognition.stop(); }};
+            window.setTimeout(() => window.__neuralVoiceCapture?.stop(), 20000);
+            return;
+        }
+        startLocalRecorder(stream);
     } catch (error) {
-        console.error('Microphone access failed:', error);
+        button.classList.remove('voice-recording');
+        emitVoice('error', '', '', 'Microphone access was denied or unavailable.');
+    }
+}
+"""
+
+VOICE_HANDSFREE_JS = """
+async (event) => {
+    const button = event.currentTarget;
+    const emitVoice = (phase, text = '', error = '') => emit({phase, text, error});
+    if (window.__neuralHandsFree) {
+        window.__neuralHandsFree.stop();
+        return;
+    }
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) {
+        emitVoice('error', '', 'Hands-free mode requires browser speech recognition. Use the microphone button instead.');
+        return;
+    }
+    try {
+        await navigator.mediaDevices.getUserMedia({audio: true}).then((stream) => stream.getTracks().forEach((track) => track.stop()));
+        const recognition = new Recognition();
+        let active = true;
+        let armedUntil = 0;
+        let announced = false;
+        recognition.continuous = true;
+        recognition.interimResults = false;
+        recognition.lang = navigator.language || 'en-US';
+        recognition.onstart = () => {
+            button.classList.add('hands-free-active');
+            if (!announced) {
+                announced = true;
+                emitVoice('hands_free_started');
+            }
+        };
+        recognition.onresult = (resultEvent) => {
+            for (let index = resultEvent.resultIndex; index < resultEvent.results.length; index++) {
+                if (!resultEvent.results[index].isFinal) continue;
+                const heard = resultEvent.results[index][0].transcript.trim();
+                const match = heard.match(/(?:^|\\b)hey\\s+neural\\b[,:.!\\s-]*(.*)$/i);
+                if (match) {
+                    const command = match[1].trim();
+                    if (command) emitVoice('wake', command);
+                    else {
+                        armedUntil = Date.now() + 8000;
+                        emitVoice('wake_armed');
+                    }
+                } else if (Date.now() < armedUntil && heard) {
+                    armedUntil = 0;
+                    emitVoice('wake', heard);
+                }
+            }
+        };
+        recognition.onerror = (errorEvent) => {
+            if (errorEvent.error !== 'no-speech' && errorEvent.error !== 'aborted') {
+                emitVoice('error', '', errorEvent.error || 'Hands-free recognition failed.');
+                // Network, permission, and capture failures cannot recover by
+                // immediately restarting the same browser recognition session.
+                if (['network', 'not-allowed', 'service-not-allowed', 'audio-capture', 'language-not-supported'].includes(errorEvent.error)) {
+                    active = false;
+                }
+            }
+        };
+        recognition.onend = () => {
+            if (active) window.setTimeout(() => { try { recognition.start(); } catch (_) {} }, 250);
+            else {
+                button.classList.remove('hands-free-active');
+                window.__neuralHandsFree = null;
+                emitVoice('hands_free_stopped');
+            }
+        };
+        window.__neuralHandsFree = {stop: () => { active = false; recognition.stop(); }};
+        recognition.start();
+    } catch (_) {
+        emitVoice('error', '', 'Microphone permission is required for hands-free mode.');
     }
 }
 """
@@ -90,6 +236,7 @@ _kb_watch_timers: dict[str, threading.Timer] = {}
 _kb_watch_observer: Any | None = None
 _active_session_id: str | None = None
 _active_request_task: asyncio.Task[str] | None = None
+_request_tasks: dict[tuple[str, str], asyncio.Task[str]] = {}
 
 # Browser screenshots are saved by the browser plugin under the workspace. Make
 # them available to this local UI without exposing the rest of the workspace.
@@ -126,13 +273,21 @@ _LOCAL_IMAGE_MARKDOWN = re.compile(
 )
 
 
-def _record_activity(session_id: str, status: str, title: str, detail: str = "") -> None:
+def _record_activity(
+    session_id: str,
+    status: str,
+    title: str,
+    detail: str = "",
+    *,
+    kind: str = "assistant",
+) -> None:
     """Store a small, thread-safe execution event for that browser session."""
     event = {
         "time": time.strftime("%H:%M:%S"),
         "status": status,
         "title": title,
         "detail": detail,
+        "kind": kind,
     }
     with _activity_lock:
         events = _activity_by_session.setdefault(session_id, [])
@@ -140,9 +295,16 @@ def _record_activity(session_id: str, status: str, title: str, detail: str = "")
         del events[:-40]
 
 
-def _clear_activity(session_id: str) -> None:
+def _clear_activity(session_id: str, *, preserve_voice: bool = False) -> None:
     with _activity_lock:
-        _activity_by_session[session_id] = []
+        if preserve_voice:
+            _activity_by_session[session_id] = [
+                event
+                for event in _activity_by_session.get(session_id, [])
+                if event.get("kind") == "voice"
+            ]
+        else:
+            _activity_by_session[session_id] = []
 
 
 def _activity_snapshot(session_id: str) -> list[dict[str, str]]:
@@ -393,6 +555,27 @@ def _start_knowledge_base_watcher() -> None:
 _start_knowledge_base_watcher()
 
 
+def _close_browser_session() -> None:
+    """Close Playwright before the UI process exits to avoid a driver EPIPE."""
+    try:
+        from plugins.browser.plugin import BrowserSession
+
+        instance = BrowserSession._instance
+        if instance is not None:
+            instance.close()
+    except Exception as exc:
+        # Shutdown is best-effort and must not obscure the original exit.
+        logger.warning("Browser shutdown cleanup warning: %s", exc)
+
+
+_shutdown_hook = getattr(app, "on_shutdown", None)
+if callable(_shutdown_hook):
+    try:
+        _shutdown_hook(_close_browser_session)
+    except Exception as exc:
+        logger.warning("Could not register browser shutdown hook: %s", exc)
+
+
 def _selection_args(selection: str) -> tuple[str | None, int | None]:
     if selection == "auto":
         return None, None
@@ -403,6 +586,19 @@ def _selection_args(selection: str) -> tuple[str | None, int | None]:
     if selection.startswith("free_api:"):
         return "free_api", int(selection.split(":", 1)[1])
     raise ValueError(f"Unknown model selection: {selection}")
+
+
+VOICE_MODEL_ID = "nex-agi/nex-n2.5-pro:free"
+
+
+def _voice_selection_args() -> tuple[str | None, int | None]:
+    """Prefer the configured Nex OpenRouter entry, then use normal routing."""
+    chain = _ui_settings.free_api_model.get("chain", [])
+    if isinstance(chain, list):
+        for index, entry in enumerate(chain):
+            if isinstance(entry, dict) and entry.get("provider") == "openrouter" and entry.get("model") == VOICE_MODEL_ID:
+                return "free_api", index
+    return None, None
 
 
 def _chat_markdown(content: str, rendered_image_paths: list[str] | None = None) -> str:
@@ -458,8 +654,8 @@ def _static_image_url(path: str) -> str | None:
     return None
 
 
-def _clear_finished_request(task: asyncio.Task[str]) -> None:
-    """Release the global request slot after a delayed worker finally exits."""
+def _clear_finished_request(task: asyncio.Task[str], request_key: tuple[str, str] | None = None) -> None:
+    """Release a request channel after a delayed worker finally exits."""
     global _active_request_task, _active_session_id
     try:
         error = task.exception()
@@ -467,12 +663,22 @@ def _clear_finished_request(task: asyncio.Task[str]) -> None:
             logger.warning("Assistant request ended after the UI stopped waiting: %s", error)
     except asyncio.CancelledError:
         pass
+    if request_key is not None and _request_tasks.get(request_key) is task:
+        _request_tasks.pop(request_key, None)
     if _active_request_task is task:
-        _active_request_task = None
-        _active_session_id = None
+        # Keep the dispatcher attached to the session while the other channel
+        # is still running; typed and voice calls are independent UI lanes.
+        _active_request_task = next(iter(_request_tasks.values()), None)
+        if _active_request_task is None:
+            _active_session_id = None
 
 
-def _store_background_result(session_id: str, task: asyncio.Task[str]) -> None:
+def _store_background_result(
+    session_id: str,
+    task: asyncio.Task[str],
+    *,
+    voice_request: bool = False,
+) -> None:
     """Capture a late worker result without touching NiceGUI from a callback.
 
     NiceGUI elements belong to the page/client event context.  A task done
@@ -487,6 +693,7 @@ def _store_background_result(session_id: str, task: asyncio.Task[str]) -> None:
             "model_used": orchestrator.get_last_model_used(session_id),
             "images": orchestrator.get_last_images(session_id),
             "error": None,
+            "voice_request": voice_request,
         }
     except Exception as exc:
         traceback.print_exc()
@@ -495,6 +702,7 @@ def _store_background_result(session_id: str, task: asyncio.Task[str]) -> None:
             "model_used": orchestrator.get_last_model_used(session_id),
             "images": [],
             "error": str(exc),
+            "voice_request": voice_request,
         }
     with _background_results_lock:
         _background_results[session_id] = payload
@@ -542,7 +750,7 @@ def _render_history(chat_log: ui.column, history: list[dict[str, Any]]) -> None:
             if index == len(history) - 1:
                 message_class += " message-enter"
             with ui.column().classes(f"assistant-message {message_class}"):
-                ui.label("You" if sent else "Assistant").classes("chat-role-label")
+                ui.label("You" if sent else "Neural").classes("chat-role-label")
                 # Keep reply content, generated media, and its routing label in one
                 # visual bubble. NiceGUI's default chat-message creates a separate
                 # bubble for each child, which previously split the model label out.
@@ -601,6 +809,18 @@ def main() -> None:
     client.setdefault("approval_mode", "auto")
     client.setdefault("selected_tier", "auto")
     client.setdefault("read_replies_aloud", False)
+    # Voice prompts should reach the model by default. Users can still turn
+    # this off with the send-toggle when they want microphone dictation only.
+    # The version marker upgrades existing browser sessions that were created
+    # while the old transcript-only default was active.
+    if client.get("voice_auto_send_default_version") != 2:
+        client["auto_send_voice_commands"] = True
+        client["voice_auto_send_default_version"] = 2
+    else:
+        client.setdefault("auto_send_voice_commands", True)
+    # A browser recognition session cannot survive a reconnect, so never show
+    # hands-free as enabled until this page explicitly starts it again.
+    client["hands_free_enabled"] = False
     if tab_storage is not None and "left_sidebar_visible" in tab_storage:
         client["left_sidebar_visible"] = bool(tab_storage["left_sidebar_visible"])
     else:
@@ -748,6 +968,14 @@ def main() -> None:
         .activity-event-done .activity-event-icon { color: #65d993; }
         .activity-event-error { border-color: rgba(255,89,99,.26); background: rgba(209,32,44,.06); }
         .activity-event-error .activity-event-icon { color: #ff6670; }
+        .activity-event-voice { border-color: rgba(161,116,232,.34); background: rgba(111,70,170,.13); }
+        .activity-event-voice .activity-event-icon { color: #c39aff; }
+        .activity-event-voice.activity-event-active { border-color: rgba(196,154,255,.42); background: rgba(111,70,170,.18); }
+        .activity-event-voice.activity-event-waiting { border-color: rgba(196,154,255,.34); background: rgba(111,70,170,.14); }
+        .activity-event-voice.activity-event-done { border-color: rgba(108,190,255,.32); background: rgba(47,116,164,.14); }
+        .activity-event-voice.activity-event-done .activity-event-icon { color: #79c8ff; }
+        .activity-event-voice.activity-event-error { border-color: rgba(255,126,174,.38); background: rgba(139,52,105,.16); }
+        .activity-event-voice.activity-event-error .activity-event-icon { color: #ff8fbd; }
         .activity-event-title { color: #f1f3f5; font-size: .77rem; font-weight: 700; line-height: 1.35; }
         .activity-event-detail { margin-top: .18rem; color: #aeb5c0; font-size: .7rem; line-height: 1.42; overflow-wrap: anywhere; }
         .activity-event-time { color: #747b86; font-size: .62rem; white-space: nowrap; }
@@ -825,6 +1053,14 @@ def main() -> None:
         .voice-output-toggle { color: #8e96a2; }
         .voice-output-toggle.is-active { color: #ff5661; background: rgba(209,32,44,.14); }
         .voice-output-toggle .q-icon { font-size: 1.12rem; }
+        .voice-play-button, .voice-stop-button, .hands-free-button, .voice-auto-send-toggle { color: #9ca3af; }
+        .voice-play-button:hover, .hands-free-button:hover, .voice-auto-send-toggle.is-active { color: #ff6872; background: rgba(209,32,44,.14); }
+        .hands-free-button.hands-free-active { color: #f7db7c; background: rgba(242,201,76,.14); }
+        .speech-indicator { padding: .2rem .42rem; border-radius: 999px; color: #ff9aa1; background: rgba(209,32,44,.12); font-size: .58rem; font-weight: 800; letter-spacing: .07em; }
+        .voice-input-button.voice-recording { color: #ff6670; background: rgba(209,32,44,.18); }
+        .q-tooltip { max-width: min(360px, calc(100vw - 2rem)) !important; white-space: normal !important; overflow-wrap: anywhere; line-height: 1.35; }
+        .q-notification { max-width: min(440px, calc(100vw - 2rem)) !important; }
+        .q-notification__message { white-space: normal !important; overflow-wrap: anywhere; line-height: 1.35; }
         .assistant-header { flex-wrap: wrap !important; column-gap: var(--space-3); row-gap: var(--space-2); }
         .sidebar-toggle { position: relative; z-index: 2; margin-right: var(--space-2); pointer-events: auto; }
         .neural-logo { margin-left: var(--space-1); color: #ff4d57; pointer-events: none; filter: drop-shadow(0 0 8px rgba(209,32,44,.26)); }
@@ -1161,7 +1397,8 @@ def main() -> None:
             for index, event in enumerate(reversed(events)):
                 status = event["status"]
                 entry_class = " activity-enter" if index == 0 else ""
-                with ui.row().classes(f"activity-event activity-event-{status} no-wrap{entry_class}"):
+                voice_class = " activity-event-voice" if event.get("kind") == "voice" else ""
+                with ui.row().classes(f"activity-event activity-event-{status}{voice_class} no-wrap{entry_class}"):
                     ui.icon(icon_for_status.get(status, "info")).classes("activity-event-icon")
                     with ui.column().classes("gap-0 flex-grow"):
                         ui.label(event["title"]).classes("activity-event-title")
@@ -1282,6 +1519,27 @@ def main() -> None:
             remove="" if visible else "left-sidebar-open",
         )
 
+    speech_state: dict[str, Any] = {"task": None, "active": False, "latest_reply": ""}
+    voice_state: dict[str, Any] = {"listening": False, "hands_free": False}
+    speech_indicator: Any | None = None
+    stop_speech_button: Any | None = None
+    mic_button: Any | None = None
+    hands_free_button: Any | None = None
+    auto_send_voice_button: Any | None = None
+
+    def record_voice_activity(status: str, title: str, detail: str = "") -> None:
+        """Record microphone/model progress in the distinct voice activity style."""
+        _record_activity(session_id, status, title, detail, kind="voice")
+
+    async def dispatch_audio_event(event: Any) -> None:
+        """Keep browser voice events in NiceGUI's client slot.
+
+        Do not wrap this in ``asyncio.create_task``: detached tasks lose the
+        client slot, so notifications and transcript/UI updates raise the
+        runtime error shown in the terminal instead of reaching the chat.
+        """
+        await handle_audio_event(event)
+
     with ui.row().classes("assistant-header items-center no-wrap"):
         left_sidebar_toggle = ui.button(
             icon="menu_open" if client["left_sidebar_visible"] else "menu",
@@ -1313,6 +1571,24 @@ def main() -> None:
                 "voice-output-toggle" + (" is-active" if client["read_replies_aloud"] else "")
             )
             read_aloud_toggle.tooltip("Read replies aloud")
+            ui.button(icon="play_arrow", on_click=lambda: play_latest_reply()).props(
+                "flat round dense aria-label='Read latest reply aloud'"
+            ).classes("voice-play-button").tooltip("Read the latest assistant reply")
+            stop_speech_button = ui.button(icon="stop", on_click=lambda: stop_reply_speech()).props(
+                "flat round dense aria-label='Stop reading aloud'"
+            ).classes("voice-stop-button")
+            stop_speech_button.disable()
+            stop_speech_button.tooltip("Stop reading aloud")
+            hands_free_button = ui.button(icon="hearing_disabled", on_click=None).props(
+                "flat round dense aria-label='Hands-free mode: off'"
+            ).classes("hands-free-button").on(
+                "click",
+                dispatch_audio_event,
+                js_handler=VOICE_HANDSFREE_JS,
+            )
+            hands_free_button.tooltip("Enable hands-free listening for ‘Hey Neural’")
+            speech_indicator = ui.label("SPEAKING").classes("speech-indicator")
+            speech_indicator.set_visibility(False)
         with ui.row().classes("assistant-status service-unknown items-center no-wrap") as header_status:
             ui.icon("circle").classes("assistant-status-dot")
             header_status_label = ui.label("CHECKING")
@@ -1321,61 +1597,272 @@ def main() -> None:
         _render_history(chat_log, client["chat_history"])
 
     dialog_holder: dict[str, Any] = {}
-    sending = {"active": False}
+    # Voice and typed prompts use independent UI channels. A voice model call
+    # must not prevent a normal typed prompt from being submitted concurrently.
+    sending = {"voice": False, "text": False}
+
+    def refresh_speech_controls() -> None:
+        active = bool(speech_state["active"])
+        if speech_indicator is not None:
+            speech_indicator.set_visibility(active)
+        if stop_speech_button is not None:
+            if active:
+                stop_speech_button.enable()
+            else:
+                stop_speech_button.disable()
+
+    def stop_reply_speech() -> None:
+        stop_speaking()
+        speech_state["active"] = False
+        refresh_speech_controls()
+
+    def speak_reply(reply: str) -> None:
+        clean_reply = speech_text(reply)
+        if not clean_reply:
+            return
+        stop_reply_speech()
+        speech_state["latest_reply"] = reply
+        speech_state["active"] = True
+        speech_state["task"] = asyncio.create_task(run.io_bound(speak_text, clean_reply))
+        refresh_speech_controls()
+
+    def play_latest_reply() -> None:
+        latest = speech_state["latest_reply"]
+        if not latest:
+            latest = next(
+                (
+                    str(entry.get("content", ""))
+                    for entry in reversed(client["chat_history"])
+                    if entry.get("role") == "assistant" and not str(entry.get("content", "")).startswith("[error]")
+                ),
+                "",
+            )
+        if latest:
+            speak_reply(latest)
+        else:
+            ui.notify("There is no Neural reply to read yet.", type="warning")
+
+    def refresh_speech_playback() -> None:
+        task = speech_state.get("task")
+        if task is None or not task.done():
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            logger.warning("Voice playback task failed: %s", exc)
+            ui.notify("Neural could not play that reply aloud.", type="warning")
+        finally:
+            speech_state["task"] = None
+            speech_state["active"] = False
+            refresh_speech_controls()
+
+    def toggle_auto_send_voice() -> None:
+        enabled = not bool(client["auto_send_voice_commands"])
+        client["auto_send_voice_commands"] = enabled
+        if auto_send_voice_button is not None:
+            auto_send_voice_button.set_icon("send_to_mobile" if enabled else "send_to_mobile_off")
+            auto_send_voice_button.classes(add="is-active" if enabled else "", remove="" if enabled else "is-active")
+            auto_send_voice_button.tooltip(
+                "Auto-send voice prompts" if enabled else "Voice transcript only"
+            )
 
     async def handle_audio_event(event: Any) -> None:
         payload = event.args[0] if isinstance(event.args, list) and event.args else event.args
-        if not isinstance(payload, str) or not payload:
+        if not isinstance(payload, dict):
             return
-        try:
-            audio_bytes = base64.b64decode(payload)
-        except Exception:
-            ui.notify("The recorded audio could not be decoded.", type="negative")
+        phase = str(payload.get("phase", ""))
+        transcript = str(payload.get("text", "")).strip()
+        if phase == "listening":
+            if voice_state["listening"]:
+                # Browser recognition can emit a second listening event when
+                # it falls back to the local recorder after a network error.
+                return
+            voice_state["listening"] = True
+            if mic_button is not None:
+                mic_button.set_icon("graphic_eq")
+            record_voice_activity("active", "Voice input started", "Listening for a microphone prompt.")
             return
-        transcript = await run.io_bound(transcribe_audio, audio_bytes)
+        if phase == "partial":
+            if transcript:
+                message_input.value = transcript
+                message_input.update()
+            return
+        if phase in {"stopped", "cancelled"}:
+            voice_state["listening"] = False
+            if mic_button is not None:
+                mic_button.set_icon("mic")
+            if phase == "cancelled":
+                record_voice_activity(
+                    "error",
+                    "Voice input cancelled",
+                    "The microphone recording was stopped before a prompt was submitted.",
+                )
+            else:
+                record_voice_activity("error", "Voice input stopped", "No speech was detected.")
+            return
+        if phase == "hands_free_started":
+            already_listening = bool(voice_state["hands_free"])
+            voice_state["hands_free"] = True
+            client["hands_free_enabled"] = True
+            # Hands-free is an explicit conversational opt-in, so reply audio
+            # is enabled for this session. The speaker control can still mute
+            # it again without disabling wake-word listening.
+            client["read_replies_aloud"] = True
+            read_aloud_toggle.set_icon("volume_up")
+            read_aloud_toggle.classes(add="is-active", remove="")
+            if hands_free_button is not None:
+                hands_free_button.set_icon("hearing")
+                hands_free_button.classes(add="hands-free-active", remove="")
+            if not already_listening:
+                record_voice_activity(
+                    "active",
+                    "Hands-free listening started",
+                    "Waiting for the wake phrase ‘Hey Neural’.",
+                )
+                ui.notify("Hands-free mode is listening for ‘Hey Neural’.", type="positive")
+            return
+        if phase == "hands_free_stopped":
+            voice_state["hands_free"] = False
+            client["hands_free_enabled"] = False
+            if hands_free_button is not None:
+                hands_free_button.set_icon("hearing_disabled")
+                hands_free_button.classes(add="", remove="hands-free-active")
+            record_voice_activity("done", "Hands-free listening stopped", "Wake-word listening is off.")
+            return
+        if phase == "wake_armed":
+            record_voice_activity(
+                "active",
+                "Voice wake phrase detected",
+                "Listening for the command that follows ‘Hey Neural’.",
+            )
+            ui.notify("Neural is listening for your command.", type="positive")
+            return
+        if phase == "wake":
+            if not transcript:
+                return
+            await send_message(transcript, voice_request=True)
+            return
+        if phase == "error":
+            voice_state["listening"] = False
+            if mic_button is not None:
+                mic_button.set_icon("mic")
+            error = str(payload.get("error") or "Voice input is unavailable.")
+            if voice_state["hands_free"]:
+                voice_state["hands_free"] = False
+                client["hands_free_enabled"] = False
+                if hands_free_button is not None:
+                    hands_free_button.set_icon("hearing_disabled")
+                    hands_free_button.classes(add="", remove="hands-free-active")
+                if error == "network":
+                    error = (
+                        "Hands-free listening cannot reach your browser's speech-recognition service. "
+                        "Use the microphone button for local Whisper transcription instead."
+                    )
+            record_voice_activity("error", "Voice input failed", error)
+            ui.notify(error, type="warning")
+            return
+        if phase == "audio":
+            encoded_audio = str(payload.get("payload", ""))
+            record_voice_activity(
+                "active",
+                "Voice transcription started",
+                "Transcribing the recording locally with Whisper.",
+            )
+            try:
+                audio_bytes = base64.b64decode(encoded_audio)
+            except Exception:
+                record_voice_activity("error", "Voice transcription failed", "The recorded audio could not be decoded.")
+                ui.notify("The recorded audio could not be decoded.", type="negative")
+                return
+            transcript = await run.io_bound(transcribe_audio, audio_bytes)
+        if phase not in {"final", "audio"}:
+            return
+        voice_state["listening"] = False
+        if mic_button is not None:
+            mic_button.set_icon("mic")
         if transcript:
             message_input.value = transcript
             message_input.update()
+            record_voice_activity("done", "Voice transcription completed", f"Transcript: {transcript[:180]}")
+            if client["auto_send_voice_commands"]:
+                await send_message(transcript, voice_request=True)
+            else:
+                record_voice_activity(
+                    "done",
+                    "Voice transcript ready",
+                    "The transcript is in the message box. Enable auto-send or press Send to ask Neural.",
+                )
         else:
+            record_voice_activity("error", "Voice transcription failed", "No speech was detected in the recording.")
             ui.notify("I could not transcribe that recording.", type="warning")
 
-    async def send_message() -> None:
+    async def send_message(user_message: str | None = None, *, voice_request: bool = False) -> None:
         global _active_request_task, _active_session_id
-        user_message = message_input.value.strip()
-        if not user_message or sending["active"]:
+        request_channel = "voice" if voice_request else "text"
+        request_key = (session_id, request_channel)
+        user_message = (user_message or message_input.value).strip()
+        if not user_message:
+            if voice_request:
+                record_voice_activity("error", "Voice request failed", "The transcript was empty, so nothing was sent to Neural.")
             return
-        if _active_request_task is not None and not _active_request_task.done():
-            ui.notify("The previous request is still running. Please wait before sending another message.", type="warning")
+        if sending[request_channel]:
+            if voice_request:
+                record_voice_activity("error", "Voice request failed", "Neural is already handling another request.")
+                ui.notify("Neural is already handling the previous voice request.", type="warning")
+            else:
+                ui.notify("The previous typed request is still running. Please wait before sending another message.", type="warning")
             return
-        sending["active"] = True
+        previous_task = _request_tasks.get(request_key)
+        if previous_task is not None and not previous_task.done():
+            if voice_request:
+                record_voice_activity("error", "Voice request failed", "The previous request is still running.")
+                ui.notify("Neural is already handling the previous voice request.", type="warning")
+            else:
+                ui.notify("The previous request is still running. Please wait before sending another message.", type="warning")
+            return
+        sending[request_channel] = True
         message_input.value = ""
         history = client["chat_history"]
         history.append({"role": "user", "content": user_message})
         _render_history(chat_log, history)
-        _clear_activity(session_id)
-        _record_activity(session_id, "active", "Request started", "Sending your message to the assistant.")
-        _record_activity(session_id, "active", "Assistant is thinking", "Selecting a model and deciding whether tools are needed.")
+        if voice_request:
+            record_voice_activity(
+                "active",
+                "Voice request started",
+                "Sending the transcribed prompt to Neural; the voice model has an OpenRouter fallback chain.",
+            )
+        if not voice_request:
+            _clear_activity(session_id, preserve_voice=True)
+            _record_activity(session_id, "active", "Request started", "Sending your message to Neural.")
+            _record_activity(session_id, "active", "Neural is thinking", "Selecting a model and deciding whether tools are needed.")
         try:
             _active_session_id = session_id
+            requested_tier, requested_chain_index = (
+                _voice_selection_args() if voice_request else _selection_args(client["selected_tier"])
+            )
             task = asyncio.create_task(
                 run.io_bound(
                     orchestrator.handle_message,
                     session_id,
                     user_message,
-                    force_tier=_selection_args(client["selected_tier"])[0],
-                    force_chain_start_index=_selection_args(client["selected_tier"])[1],
+                    force_tier=requested_tier,
+                    force_chain_start_index=requested_chain_index,
                 )
             )
             _active_request_task = task
-            task.add_done_callback(_clear_finished_request)
+            _request_tasks[request_key] = task
+            task.add_done_callback(lambda completed_task: _clear_finished_request(completed_task, request_key))
             try:
                 reply = await asyncio.wait_for(asyncio.shield(task), timeout=REQUEST_UI_TIMEOUT_SECONDS)
             except TimeoutError:
                 _record_activity(
                     session_id,
                     "waiting",
-                    "Long-running request continues",
-                    "The worker is still running in the background. Its final reply and any generated image will appear here automatically.",
+                    "Voice request continues" if voice_request else "Long-running request continues",
+                    "The voice worker is still running; its final reply will appear here automatically."
+                    if voice_request
+                    else "The worker is still running in the background. Its final reply and any generated image will appear here automatically.",
+                    kind="voice" if voice_request else "assistant",
                 )
                 pending_entry = {
                     "role": "assistant",
@@ -1395,8 +1882,14 @@ def main() -> None:
                 # The worker may finish several minutes later.  Only capture
                 # its result in the done callback; the client-scoped timer
                 # below performs all NiceGUI updates in the page context.
-                task.add_done_callback(lambda completed_task: _store_background_result(session_id, completed_task))
-                sending["active"] = False
+                task.add_done_callback(
+                    lambda completed_task: _store_background_result(
+                        session_id,
+                        completed_task,
+                        voice_request=voice_request,
+                    )
+                )
+                sending[request_channel] = False
                 return
             if (
                 not _last_confirmation_results.get(session_id, True)
@@ -1405,14 +1898,24 @@ def main() -> None:
                 reply = "Command denied by user."
         except Exception as exc:
             traceback.print_exc()
-            _record_activity(session_id, "error", "Request failed", str(exc))
+            if voice_request:
+                record_voice_activity("error", "Voice request failed", str(exc))
+            else:
+                _record_activity(session_id, "error", "Request failed", str(exc))
             reply = f"[error] {exc}"
         model_used = orchestrator.get_last_model_used(session_id)
-        if not reply.startswith("[error]"):
+        voice_failed = reply.startswith("[error]") or "task may be incomplete" in reply.casefold()
+        if voice_request:
+            record_voice_activity(
+                "error" if voice_failed else "done",
+                "Voice request failed" if voice_failed else "Voice request completed",
+                str(reply)[:240] if voice_failed else f"Completed via {model_used or 'the configured voice model chain'}.",
+            )
+        elif not reply.startswith("[error]"):
             _record_activity(
                 session_id,
                 "done",
-                "Assistant reply received",
+                "Neural reply received",
                 f"Completed via {model_used}." if model_used else "Completed without a model response label.",
             )
         history.append({
@@ -1421,17 +1924,23 @@ def main() -> None:
             "model_used": model_used,
             "images": orchestrator.get_last_images(session_id),
         })
+        speech_state["latest_reply"] = reply
         _render_history(chat_log, history)
         # A reminder can be created by the assistant during this turn. Refresh
         # immediately so it is visible without waiting for the periodic poll.
         refresh_productivity_panel()
         if client["read_replies_aloud"] and not reply.startswith("[error]"):
-            await run.io_bound(speak_text, reply)
+            speak_reply(reply)
+        if voice_request:
+            ui.notify(
+                "Voice request completed." if not voice_failed else "Voice request failed.",
+                type="negative" if voice_failed else "positive",
+            )
         await ui.run_javascript(
             "const log = document.querySelector('.assistant-chat'); "
             "if (log) log.scrollTop = log.scrollHeight;"
         )
-        sending["active"] = False
+        sending[request_channel] = False
 
     assistant_input_bar = ui.row().classes(
         "assistant-input" + (" left-sidebar-open" if client["left_sidebar_visible"] else "")
@@ -1440,12 +1949,20 @@ def main() -> None:
         with ui.column().classes("assistant-compose-inner"):
             with ui.row().classes("assistant-compose-row items-center no-wrap"):
                 ui.icon("chat_bubble_outline").classes("assistant-compose-icon")
-                message_input = ui.input(placeholder="Message the assistant").props("outlined") \
+                message_input = ui.input(placeholder="Message Neural").props("outlined") \
                     .classes("assistant-input-field flex-grow").style("background-color: #292a2e; color: #f8fafc;") \
                     .on("keydown.enter", send_message)
-                ui.button(icon="mic", on_click=None).props("flat round").classes("voice-input-button").on(
-                    "click", handle_audio_event, js_handler=VOICE_RECORD_JS
-                ).tooltip("Record voice input")
+                mic_button = ui.button(icon="mic", on_click=None).props("flat round aria-label='Start voice input'").classes("voice-input-button").on(
+                    "click", handle_audio_event, js_handler=VOICE_CAPTURE_JS
+                )
+                mic_button.tooltip("Speak a message; it stops automatically after you finish, or click again to stop")
+                auto_send_voice_button = ui.button(
+                    icon="send_to_mobile" if client["auto_send_voice_commands"] else "send_to_mobile_off",
+                    on_click=lambda: toggle_auto_send_voice(),
+                ).props("flat round dense aria-label='Auto-send voice commands'").classes(
+                    "voice-auto-send-toggle" + (" is-active" if client["auto_send_voice_commands"] else "")
+                )
+                auto_send_voice_button.tooltip("Auto-send voice prompts" if client["auto_send_voice_commands"] else "Voice transcript only")
                 ui.button("Send", on_click=send_message, icon="send", color="primary").classes("assistant-send")
             ui.label("Enter to send · Tool approvals appear here when needed").classes("compose-helper")
 
@@ -1486,42 +2003,69 @@ def main() -> None:
                 }
             )
         client["chat_history"] = history
+        speech_state["latest_reply"] = completed_reply
+        voice_request = bool(background_result.get("voice_request"))
         if background_result.get("error"):
-            _record_activity(session_id, "error", "Long-running request failed", str(background_result["error"]))
+            if voice_request:
+                record_voice_activity("error", "Voice request failed", str(background_result["error"])[:240])
+            else:
+                _record_activity(session_id, "error", "Long-running request failed", str(background_result["error"]))
         else:
-            _record_activity(
-                session_id,
-                "done",
-                "Long-running reply received",
-                f"Completed via {completed_model}." if completed_model else "Completed successfully.",
-            )
-            if background_result.get("images"):
+            voice_failed = completed_reply.startswith("[error]") or "task may be incomplete" in completed_reply.casefold()
+            if voice_request:
+                record_voice_activity(
+                    "error" if voice_failed else "done",
+                    "Voice request failed" if voice_failed else "Voice request completed",
+                    completed_reply[:240]
+                    if voice_failed
+                    else f"Completed via {completed_model or 'the configured voice model chain'}.",
+                )
+            else:
                 _record_activity(
                     session_id,
                     "done",
-                    "Generated image ready",
-                    f"{len(background_result['images'])} image file(s) are available in the chat.",
+                    "Long-running reply received",
+                    f"Completed via {completed_model}." if completed_model else "Completed successfully.",
                 )
+                if background_result.get("images"):
+                    _record_activity(
+                        session_id,
+                        "done",
+                        "Generated image ready",
+                        f"{len(background_result['images'])} image file(s) are available in the chat.",
+                    )
         _render_history(chat_log, history)
         # The completed background turn may have created a reminder; update
         # the sidebar as soon as its final result arrives.
         refresh_productivity_panel()
         if client["read_replies_aloud"] and not completed_reply.startswith("[error]"):
-            await run.io_bound(speak_text, completed_reply)
+            speak_reply(completed_reply)
+        if voice_request:
+            ui.notify(
+                "Voice request completed." if not background_result.get("error") else "Voice request failed.",
+                type="positive" if not background_result.get("error") else "negative",
+            )
         await ui.run_javascript(
             "const log = document.querySelector('.assistant-chat'); "
             "if (log) log.scrollTop = log.scrollHeight;"
         )
 
     ui.timer(0.3, refresh_live_ui)
+    ui.timer(0.2, refresh_speech_playback)
     ui.timer(2.0, refresh_image_setup)
     ui.timer(10.0, refresh_productivity_panel)
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(
-        title=PAGE_TITLE,
-        port=_available_port(),
-        storage_secret="personal-ai-assistant",
-        reload=False,
-    )
+    try:
+        ui.run(
+            title=PAGE_TITLE,
+            port=_available_port(),
+            storage_secret="personal-ai-assistant",
+            reload=False,
+        )
+    except KeyboardInterrupt:
+        # Ctrl+C is an intentional, clean stop—not an application failure.
+        logger.info("Neural stopped by user.")
+    finally:
+        _close_browser_session()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import atexit
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -303,6 +304,21 @@ class BrowserSession:
 
     def close(self) -> None:
         self.restart()
+
+
+def _close_browser_session_at_exit() -> None:
+    """Close the shared Playwright driver before Python tears down its pipes."""
+    instance = BrowserSession._instance
+    if instance is not None:
+        try:
+            instance.close()
+        except Exception as exc:
+            # Shutdown is best-effort; never replace the original application
+            # exit with a second exception from an already-closing driver.
+            print(f"browser: shutdown cleanup warning: {exc}")
+
+
+atexit.register(_close_browser_session_at_exit)
 
 
 def _page_summary(page: Any, tab_id: str) -> dict[str, Any]:
