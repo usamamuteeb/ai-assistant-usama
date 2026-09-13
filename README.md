@@ -418,6 +418,10 @@ Browser actions are visible on the desktop by default (`browser.headless: false`
 
 This project can also opt into an optional `plugins/system_monitor/plugin.py` toolset for local system health and process inspection. It exposes `system_stats`, `list_processes`, and `kill_process` tools. The destructive `kill_process` tool is gated behind the same explicit confirm callback pattern as the shell tool, so it will not terminate anything without user approval.
 
+### WhatsApp Web (local, personal use)
+
+The optional `plugins/whatsapp/plugin.py` uses the existing visible Playwright browser session and WhatsApp Web rather than the WhatsApp Cloud API. It provides `whatsapp_open`, `whatsapp_list_unread_chats`, `whatsapp_read_chat`, and `whatsapp_send_message`. On first use, scan the QR code in the browser with the phone's WhatsApp app. Reading is not confirmation-gated; sending always asks for approval with the resolved destination and exact message text. Denying the prompt leaves the message unsent so it can be edited or cancelled. This is local browser automation, so the assistant process and logged-in WhatsApp Web session must remain available and WhatsApp Web changes may require maintenance.
+
 ## File and document automation
 
 The `file_automation` plugin can rename, move, copy, and organize files anywhere

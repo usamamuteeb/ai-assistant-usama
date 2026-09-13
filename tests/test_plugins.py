@@ -18,6 +18,7 @@ PLUGIN_NAMES = [
     "google_workspace",
     "image_generation",
     "screen_reader",
+    "whatsapp",
     "windows_control",
 ]
 
@@ -67,6 +68,31 @@ def test_browser_confirm_gated_tools_deny_before_playwright_access():
     assert "confirmation denied or not provided." in click["error"]
     assert "confirmation denied or not provided." in fill["error"]
     get_page.assert_not_called()
+
+
+def test_whatsapp_send_shows_destination_and_exact_message_before_sending():
+    module = _load_plugin("whatsapp")
+    confirm = MagicMock(return_value=False)
+    tool = module.WhatsAppSendMessageTool(confirm_fn=confirm)
+    page = MagicMock()
+    page.url = "https://web.whatsapp.com/"
+    session = MagicMock()
+    session.run_with_recovery.side_effect = lambda operation: operation(page)
+    tool.session = session
+    row = MagicMock()
+    row.inner_text.return_value = "Alice\nLast preview"
+
+    with patch.object(module, "_require_ready", return_value=None), patch.object(
+        module, "_find_chat", return_value=row
+    ):
+        result = tool.run(contact="Alice", message="Hello — please call me.")
+
+    assert result == {"error": "WhatsApp message not sent: confirmation denied or not provided."}
+    prompt = confirm.call_args.args[0]
+    assert "Alice" in prompt
+    assert "Hello — please call me." in prompt
+    assert "unsent" in prompt
+    assert session.run_with_recovery.call_count == 1
 
 
 def test_google_confirm_gated_tools_deny_before_api_client_access():

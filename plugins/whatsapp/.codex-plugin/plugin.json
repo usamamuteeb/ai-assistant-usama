@@ -1,0 +1,21 @@
+{
+  "name": "whatsapp",
+  "version": "0.1.0",
+  "description": "Local WhatsApp Web reading and messaging tools.",
+  "author": {
+    "name": "Local developer"
+  },
+  "interface": {
+    "displayName": "WhatsApp Web",
+    "shortDescription": "Read chats and send WhatsApp messages locally.",
+    "longDescription": "Uses the existing visible Playwright browser session for WhatsApp Web. Messages require explicit confirmation with the recipient and exact text shown.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Open WhatsApp Web",
+      "Show my unread WhatsApp chats",
+      "Send a WhatsApp message"
+    ]
+  }
+}

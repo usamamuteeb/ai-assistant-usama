@@ -77,7 +77,9 @@ routing:
 
 tool_relevance_filter:
   enabled: true
-  max_tools: 10
+  # The mandatory core list includes WhatsApp Web so the chatbot can describe
+  # and use it even when relevance filtering is enabled.
+  max_tools: 14
   min_tools: 6
   core_tools:
     - filesystem
@@ -88,6 +90,10 @@ tool_relevance_filter:
     - list_tasks
     - set_reminder
     - list_reminders
+    - whatsapp_open
+    - whatsapp_list_unread_chats
+    - whatsapp_read_chat
+    - whatsapp_send_message
     # Keep the screen-reader capability available for explicit screen-reading
     # requests; local keyword ranking alone can hide it behind the tool cap.
     - read_screen_text
