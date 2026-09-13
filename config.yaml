@@ -79,7 +79,7 @@ tool_relevance_filter:
   enabled: true
   # The mandatory core list includes WhatsApp Web so the chatbot can describe
   # and use it even when relevance filtering is enabled.
-  max_tools: 14
+  max_tools: 20
   min_tools: 6
   core_tools:
     - filesystem
@@ -93,7 +93,13 @@ tool_relevance_filter:
     - whatsapp_open
     - whatsapp_list_unread_chats
     - whatsapp_read_chat
+    - whatsapp_get_last_message_status
     - whatsapp_send_message
+    - remember_fact
+    - recall_facts
+    - log_episode
+    - recall_episodes
+    - recall_procedure
     # Keep the screen-reader capability available for explicit screen-reading
     # requests; local keyword ranking alone can hide it behind the tool cap.
     - read_screen_text
@@ -110,6 +116,14 @@ memory:
   chroma_path: data/chroma
   chroma_collection: assistant_memory
   max_history_messages: 12            # how many past turns to load; tune this if 12 feels too short
+
+memory_retrieval:
+  similarity_weight: 0.6
+  recency_weight: 0.2
+  importance_weight: 0.2
+  half_life_days: 14
+  procedural_memory:
+    similarity_threshold: 0.85
 
 filesystem_tool:
   workspace_root: workspace           # relative paths are resolved here
@@ -131,6 +145,9 @@ browser:
   # Keep browser actions visible on the desktop. Set this to true only when you
   # explicitly want unattended, invisible browser automation.
   headless: false
+  # Project-local persistent profile. This keeps the WhatsApp Web login after
+  # the first QR scan without exposing the user's normal Chrome profile.
+  profile_dir: data/browser_profile
 
 image_generation:
   # Images are generated locally. No Gemini image model or cloud image credits

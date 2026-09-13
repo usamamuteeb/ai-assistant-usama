@@ -25,6 +25,27 @@ it into whatever shape your use cases need. You can still run Goose/n8n alongsid
 - **CLI chat loop** as the interface layer — swap this for a Telegram bot or GUI later without touching
   anything else.
 
+## Memory system
+
+The assistant keeps four complementary local memory layers. The original
+`assistant_memory` collection continues to keep a lightweight record of every
+conversation turn. It is separate from the three purposeful layers below:
+
+- **Semantic memory** stores durable facts and preferences with
+  `remember_fact`, recalls them with `recall_facts`, and removes them with
+  `forget_fact`.
+- **Episodic memory** stores meaningful decisions, milestones, and outcomes
+  with `log_episode`; `recall_episodes` finds those events later.
+- **Procedural memory** learns successful sequences involving two or more
+  distinct tools and exposes them through `recall_procedure` as suggestions,
+  never as automatically executed actions.
+
+All of these writes and searches are local and free: Chroma and SQLite do the
+storage and ranking, with no additional model/API call. Retrieval blends
+semantic similarity with recency and importance. Tune the weights, retention
+half-life, and procedure matching threshold under `memory_retrieval` in
+`config.yaml`.
+
 ## Setup
 
 ```bash
@@ -420,7 +441,7 @@ This project can also opt into an optional `plugins/system_monitor/plugin.py` to
 
 ### WhatsApp Web (local, personal use)
 
-The optional `plugins/whatsapp/plugin.py` uses the existing visible Playwright browser session and WhatsApp Web rather than the WhatsApp Cloud API. It provides `whatsapp_open`, `whatsapp_list_unread_chats`, `whatsapp_read_chat`, and `whatsapp_send_message`. On first use, scan the QR code in the browser with the phone's WhatsApp app. Reading is not confirmation-gated; sending always asks for approval with the resolved destination and exact message text. Denying the prompt leaves the message unsent so it can be edited or cancelled. This is local browser automation, so the assistant process and logged-in WhatsApp Web session must remain available and WhatsApp Web changes may require maintenance.
+The optional `plugins/whatsapp/plugin.py` uses the visible Playwright browser session and WhatsApp Web rather than the WhatsApp Cloud API. It provides `whatsapp_open`, `whatsapp_list_unread_chats`, `whatsapp_read_chat`, `whatsapp_get_last_message_status`, and `whatsapp_send_message`. The browser now uses a project-local persistent profile at `data/browser_profile`, so scan the QR code only on first use; WhatsApp itself can still require a new login if the linked-device session expires or is revoked. The plugin reuses a single WhatsApp tab (including an existing blank tab) instead of opening duplicates. Reading is not confirmation-gated; sending always asks for approval with the resolved destination and exact message text. `whatsapp_get_last_message_status` reports receipt icons as **sent**, **delivered**, **read**, or **unknown**—it never guesses a status if WhatsApp's current UI does not expose one. Denying a send leaves the message unsent so it can be edited or cancelled. This is local browser automation, so the assistant process and logged-in WhatsApp Web session must remain available and WhatsApp Web changes may require maintenance.
 
 ## File and document automation
 

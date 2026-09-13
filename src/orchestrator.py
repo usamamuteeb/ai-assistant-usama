@@ -42,6 +42,14 @@ the user did not request — if something is ambiguous, ask the user instead of 
 For questions about documents already ingested into the knowledge base, use search_knowledge_base
 for semantic retrieval. Do not use filesystem tools to read or dump raw PDF bytes for a knowledge-
 base question unless the user explicitly asks for the document's raw contents or file operations.
+You have tools to remember durable facts (remember_fact), log significant events or decisions
+(log_episode), and recall past task procedures (recall_procedure). Use these sparingly and with
+real judgment — call remember_fact only for information that will matter in future conversations
+(stated preferences, standing project facts), not routine details. Call log_episode only for
+genuinely significant outcomes (a decision made, a problem solved, a milestone reached), not every
+exchange. Before starting a multi-step task, consider calling recall_procedure to check if a similar
+task has a known successful sequence — but always adapt it to the current request rather than blindly
+repeating it.
 """
 
 MAX_TOOL_ITERATIONS = 10
@@ -82,6 +90,22 @@ def _summarize_tool_result(value: Any, limit: int = 300) -> str:
     return text[:limit].rstrip() + ("..." if len(text) > limit else "")
 
 
+def _turn_importance(user_message: str, assistant_reply: str, tool_trace: list[str]) -> int:
+    """Assign a small local importance signal without another model call."""
+    score = 1
+    combined_length = len(user_message.strip()) + len(assistant_reply.strip())
+    if combined_length >= 300:
+        score += 1
+    if tool_trace:
+        score += 1
+    if len(set(tool_trace)) >= 2:
+        score += 1
+    reply_lower = assistant_reply.lower()
+    if "[error]" in reply_lower or "task may be incomplete" in reply_lower:
+        score += 1
+    return min(5, score)
+
+
 class Orchestrator:
     def __init__(self, settings: Settings, confirm_fn: Optional[Any] = None):
         self.settings = settings
@@ -90,7 +114,22 @@ class Orchestrator:
         self.vector_memory = VectorMemory(
             settings.chroma_path(), settings.memory.get("chroma_collection", "assistant_memory")
         )
-        self.tools: ToolRegistry = build_registry(settings, self.vector_memory, confirm_fn=confirm_fn)
+        self.semantic_memory = VectorMemory(settings.chroma_path(), "semantic_memory")
+        self.episodic_memory = VectorMemory(settings.chroma_path(), "episodic_memory")
+        self.procedure_signatures = VectorMemory(
+            settings.chroma_path(), "procedure_signatures", distance_space="cosine"
+        )
+        self._memory_retrieval = settings.memory_retrieval
+        self._procedure_config = self._memory_retrieval.get("procedural_memory", {})
+        self.tools: ToolRegistry = build_registry(
+            settings,
+            self.vector_memory,
+            confirm_fn=confirm_fn,
+            semantic_memory=self.semantic_memory,
+            episodic_memory=self.episodic_memory,
+            procedure_signatures=self.procedure_signatures,
+            store=self.store,
+        )
         self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self._last_model_used: dict[str, str] = {}
         self._last_images: dict[str, list[str]] = {}
@@ -122,6 +161,7 @@ class Orchestrator:
 
         anthropic_tools = self.tools.anthropic_tools()
         image_paths: list[str] = []
+        tool_call_trace: list[str] = []
         final_result = self._run_tool_loop(
             tier,
             messages,
@@ -129,6 +169,7 @@ class Orchestrator:
             relevance_context=user_message,
             force_chain_start_index=force_chain_start_index,
             image_paths=image_paths,
+            tool_call_trace=tool_call_trace,
         )
         self._last_model_used[session_id] = final_result.model_used or "unknown"
         self._last_images[session_id] = list(dict.fromkeys(image_paths))
@@ -138,8 +179,13 @@ class Orchestrator:
         # Keep a lightweight semantic trace so search_memory has something to find later.
         self.vector_memory.add_memory(
             f"User: {user_message}\nAssistant: {final_text}",
-            metadata={"session_id": session_id},
+            metadata={
+                "session_id": session_id,
+                "importance": _turn_importance(user_message, final_text, tool_call_trace),
+            },
         )
+        if self._is_successful_multitool_turn(final_text, tool_call_trace):
+            self._record_procedure(user_message, tool_call_trace)
         return final_text
 
     def get_last_model_used(self, session_id: str) -> str | None:
@@ -156,6 +202,7 @@ class Orchestrator:
         relevance_context: str = "",
         force_chain_start_index: int | None = None,
         image_paths: list[str] | None = None,
+        tool_call_trace: list[str] | None = None,
     ) -> ChatResult:
         start = time.monotonic()
         executed_results: dict[tuple[str, Any], str] = {}
@@ -281,6 +328,8 @@ class Orchestrator:
                         }
                     output_str = str(output)
                     executed_results[cache_key] = output_str
+                    if tool_call_trace is not None:
+                        tool_call_trace.append(tc.name)
                 if image_paths is not None:
                     image_paths.extend(_image_paths_from_result(output_str))
                 if len(output_str) > 4000:
@@ -311,6 +360,48 @@ class Orchestrator:
             messages.append({"role": "user", "content": tool_result_blocks})
 
         return ChatResult(text=self._stopped_tool_loop_response(messages), model_used=last_model_used)
+
+    @staticmethod
+    def _is_successful_multitool_turn(final_text: str, tool_call_trace: list[str]) -> bool:
+        """Only learn from completed, genuinely multi-tool turns."""
+        reply = final_text.strip().lower()
+        return (
+            len(set(tool_call_trace)) >= 2
+            and bool(reply)
+            and "[error]" not in reply
+            and "task may be incomplete" not in reply
+            and "waiting for your approval" not in reply
+        )
+
+    def _record_procedure(self, user_message: str, tool_call_trace: list[str]) -> None:
+        """Persist a successful tool sequence without another LLM request."""
+        try:
+            signature = user_message.strip()[:500]
+            if not signature:
+                return
+            threshold = float(
+                getattr(self, "_procedure_config", {}).get("similarity_threshold", 0.85)
+            )
+            candidates = self.procedure_signatures.search(signature, k=5)
+            matching_id: int | None = None
+            for candidate in candidates:
+                if float(candidate.get("raw_similarity", 0.0)) < threshold:
+                    continue
+                procedure_id = (candidate.get("metadata") or {}).get("procedure_id")
+                if procedure_id is not None:
+                    matching_id = int(procedure_id)
+                    break
+            if matching_id is not None:
+                self.store.mark_procedure_used(matching_id)
+                return
+            procedure_id = self.store.add_procedure(signature, tool_call_trace)
+            self.procedure_signatures.add_memory(
+                signature,
+                metadata={"procedure_id": procedure_id, "importance": 3},
+            )
+        except Exception as exc:
+            # Procedure learning must never change a successful user-facing reply.
+            print(f"[memory] Could not record procedure: {exc}")
 
     def _slow_tool_timeout_seconds(self, tool_name: str) -> int | None:
         """Return only an explicitly configured slow-tool budget, if any."""

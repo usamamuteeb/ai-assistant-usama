@@ -67,6 +67,15 @@ class SqliteStore:
                 updated_at REAL NOT NULL,
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL
             );
+
+            CREATE TABLE IF NOT EXISTS procedures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_signature TEXT NOT NULL,
+                steps TEXT NOT NULL,
+                success_count INTEGER DEFAULT 1,
+                last_used_at REAL NOT NULL,
+                created_at REAL NOT NULL
+            );
             """
         )
         # Older installations already have the original four-column tasks
@@ -355,3 +364,37 @@ class SqliteStore:
                 )
                 self.conn.commit()
             return reminders
+
+    # --- learned multi-tool procedures ---
+    def add_procedure(self, task_signature: str, steps: list[str]) -> int:
+        now = time.time()
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT INTO procedures (task_signature, steps, success_count, last_used_at, created_at) "
+                "VALUES (?, ?, 1, ?, ?)",
+                (task_signature, json.dumps(list(steps)), now, now),
+            )
+            self.conn.commit()
+            return int(cur.lastrowid)
+
+    def get_procedure(self, procedure_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM procedures WHERE id = ?", (procedure_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            decoded = json.loads(result["steps"])
+            result["steps"] = decoded if isinstance(decoded, list) else []
+        except (TypeError, json.JSONDecodeError):
+            result["steps"] = []
+        return result
+
+    def mark_procedure_used(self, procedure_id: int) -> bool:
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE procedures SET success_count = success_count + 1, last_used_at = ? WHERE id = ?",
+                (time.time(), procedure_id),
+            )
+            self.conn.commit()
+            return cur.rowcount > 0

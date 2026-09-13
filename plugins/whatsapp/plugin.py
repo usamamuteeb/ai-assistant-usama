@@ -54,6 +54,20 @@ def _is_ready(page: Any) -> bool:
         return False
 
 
+def _wait_for_initial_state(page: Any, timeout_ms: int = 8000) -> None:
+    """Give an already-linked WhatsApp Web page a short, bounded boot window."""
+    if _is_ready(page) or _page_login_state(page) == "awaiting_qr_scan":
+        return
+    try:
+        page.locator(
+            "#pane-side, [data-testid='chat-list'], [data-testid='chat-list-search']"
+        ).first.wait_for(state="visible", timeout=timeout_ms)
+    except Exception:
+        # The caller turns the resulting state into a useful loading/login
+        # response; never spend the orchestrator's whole tool-loop budget here.
+        pass
+
+
 def _require_ready(page: Any) -> dict[str, str] | None:
     if not _is_whatsapp_url(page.url):
         return _error("WhatsApp Web is not open. Use whatsapp_open first.")
@@ -220,6 +234,45 @@ def _active_chat_header(page: Any) -> str:
     return ""
 
 
+def _last_outgoing_message_status(page: Any) -> dict[str, str] | None:
+    """Read WhatsApp's visible receipt icon; never infer a receipt from text."""
+    messages = page.locator("[data-testid='msg-container']")
+    try:
+        count = messages.count()
+    except Exception:
+        return None
+    for index in range(count - 1, -1, -1):
+        try:
+            status = messages.nth(index).evaluate(
+                """
+                (element) => {
+                  const outgoing = element.matches('.message-out') ||
+                    Boolean(element.querySelector('.message-out, [data-testid="msg-check"], ' +
+                    '[data-testid="msg-dblcheck"], [data-testid="msg-dblcheck-ack"], ' +
+                    '[data-icon="msg-check"], [data-icon="msg-dblcheck"], [data-icon="msg-dblcheck-ack"]'));
+                  if (!outgoing) return null;
+                  const has = (selector) => Boolean(element.querySelector(selector));
+                  let delivery = 'unknown';
+                  if (has('[data-testid="msg-dblcheck-ack"], [data-icon="msg-dblcheck-ack"]')) {
+                    delivery = 'read';
+                  } else if (has('[data-testid="msg-dblcheck"], [data-icon="msg-dblcheck"]')) {
+                    delivery = 'delivered';
+                  } else if (has('[data-testid="msg-check"], [data-icon="msg-check"]')) {
+                    delivery = 'sent';
+                  }
+                  const text = (element.innerText || '').trim();
+                  const timestamp = element.querySelector('[data-pre-plain-text]')?.getAttribute('data-pre-plain-text') || '';
+                  return {delivery, text, timestamp};
+                }
+                """
+            )
+        except Exception:
+            continue
+        if status:
+            return status
+    return None
+
+
 class _WhatsAppTool(Tool):
     def __init__(self, root: Path = PROJECT_ROOT):
         self.session = BrowserSession.get_instance(root)
@@ -232,46 +285,59 @@ class _WhatsAppTool(Tool):
         except Exception as exc:
             return _error(f"WhatsApp Web action failed: {exc}")
 
+    def _whatsapp_page(self) -> tuple[str, Any]:
+        """Open or reuse one dedicated WhatsApp tab from the persistent profile."""
+        tab_id, page = self.session.page_for_site("web.whatsapp.com")
+        if not _is_whatsapp_url(page.url):
+            page.goto(
+                "https://web.whatsapp.com",
+                wait_until="commit",
+                timeout=15000,
+            )
+            page.wait_for_timeout(750)
+        _wait_for_initial_state(page)
+        return tab_id, page
+
+    def _run_whatsapp(self, operation: Callable[[Any], Any]) -> Any:
+        def action(_active_page: Any) -> Any:
+            _tab_id, whatsapp_page = self._whatsapp_page()
+            return operation(whatsapp_page)
+
+        return self._run_browser(action)
+
 
 class WhatsAppOpenTool(_WhatsAppTool):
     name = "whatsapp_open"
     description = (
-        "Open WhatsApp Web in the shared visible browser. On first use, scan the QR code "
-        "with the phone's WhatsApp app and then retry the requested operation."
+        "Open WhatsApp Web in its single persistent browser tab. On the first use only, scan "
+        "the QR code with the phone's WhatsApp app; the project-local browser profile keeps "
+        "that login for later app launches until WhatsApp expires or revokes it."
     )
     input_schema = {
         "type": "object",
-        "properties": {
-            "new_tab": {
-                "type": "boolean",
-                "default": False,
-                "description": "Open WhatsApp Web in a new browser tab instead of the active tab.",
-            }
-        },
+        "properties": {},
         "required": [],
     }
 
-    def run(self, new_tab: bool = False) -> Any:
-        def action(_active_page: Any) -> Any:
-            tab_id, page = self.session.page_for_open(bool(new_tab))
-            page.goto("https://web.whatsapp.com", wait_until="domcontentloaded", timeout=30000)
+    def run(self) -> Any:
+        def action(page: Any) -> Any:
             state = _page_login_state(page)
             ready = _is_ready(page)
             if state:
                 return {
                     "status": state,
                     "message": "Scan the QR code in the visible browser with WhatsApp on your phone.",
-                    "tab_id": tab_id,
+                    "tab_id": self.session.active_tab_id(),
                     "url": page.url,
                 }
             return {
                 "status": "ready" if ready else "loading",
-                "message": "WhatsApp Web is ready." if ready else "WhatsApp Web is still loading; try the operation again shortly.",
-                "tab_id": tab_id,
+                "message": "WhatsApp Web is ready." if ready else "WhatsApp Web is still loading; retry shortly.",
+                "tab_id": self.session.active_tab_id(),
                 "url": page.url,
             }
 
-        return self._run_browser(action)
+        return self._run_whatsapp(action)
 
 
 class WhatsAppListUnreadChatsTool(_WhatsAppTool):
@@ -302,7 +368,7 @@ class WhatsAppListUnreadChatsTool(_WhatsAppTool):
                 "tab_id": self.session.active_tab_id(),
             }
 
-        return self._run_browser(action)
+        return self._run_whatsapp(action)
 
 
 class WhatsAppReadChatTool(_WhatsAppTool):
@@ -344,7 +410,7 @@ class WhatsAppReadChatTool(_WhatsAppTool):
                 "tab_id": self.session.active_tab_id(),
             }
 
-        return self._run_browser(action)
+        return self._run_whatsapp(action)
 
 
 class WhatsAppSendMessageTool(_WhatsAppTool):
@@ -394,7 +460,7 @@ class WhatsAppSendMessageTool(_WhatsAppTool):
                 return _error(f"No WhatsApp chat or phone number matched '{clean_contact}'. Nothing was sent.")
             return {"status": "resolved"}
 
-        resolved = self._run_browser(locate)
+        resolved = self._run_whatsapp(locate)
         if not isinstance(resolved, dict) or resolved.get("error") or "chat_mode" not in target:
             return resolved
 
@@ -432,7 +498,56 @@ class WhatsAppSendMessageTool(_WhatsAppTool):
                 "tab_id": self.session.active_tab_id(),
             }
 
-        return self._run_browser(send)
+        return self._run_whatsapp(send)
+
+
+class WhatsAppLastMessageStatusTool(_WhatsAppTool):
+    name = "whatsapp_get_last_message_status"
+    description = (
+        "Open a WhatsApp chat and inspect its most recent outgoing visible message's receipt icon. "
+        "Returns sent (one check), delivered (two checks), read (blue two checks), or unknown when "
+        "WhatsApp does not expose a recognizable receipt. Read-only; no confirmation is needed."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "contact": {"type": "string", "description": "Visible contact or group name, or phone number."},
+        },
+        "required": ["contact"],
+    }
+
+    def run(self, contact: str) -> Any:
+        clean_contact = str(contact or "").strip()
+        if not clean_contact:
+            return _error("contact cannot be empty.")
+
+        def action(page: Any) -> Any:
+            not_ready = _require_ready(page)
+            if not_ready:
+                return not_ready
+            row = _find_chat(page, clean_contact)
+            if row is not None:
+                row.click(timeout=15000)
+            elif not _open_chat_by_phone(page, clean_contact):
+                return _error(f"No WhatsApp chat or phone number matched '{clean_contact}'.")
+            page.wait_for_timeout(500)
+            status = _last_outgoing_message_status(page)
+            if status is None:
+                return {
+                    "status": "unknown",
+                    "contact": _active_chat_header(page) or clean_contact,
+                    "message": "No visible outgoing message or delivery receipt was found in this chat.",
+                    "tab_id": self.session.active_tab_id(),
+                }
+            return {
+                "status": status["delivery"],
+                "contact": _active_chat_header(page) or clean_contact,
+                "last_message": status["text"],
+                "receipt_timestamp": status["timestamp"],
+                "tab_id": self.session.active_tab_id(),
+            }
+
+        return self._run_whatsapp(action)
 
 
 def register(confirm_fn: Optional[ConfirmFn] = None) -> list[Tool]:
@@ -440,5 +555,6 @@ def register(confirm_fn: Optional[ConfirmFn] = None) -> list[Tool]:
         WhatsAppOpenTool(),
         WhatsAppListUnreadChatsTool(),
         WhatsAppReadChatTool(),
+        WhatsAppLastMessageStatusTool(),
         WhatsAppSendMessageTool(confirm_fn=confirm_fn),
     ]

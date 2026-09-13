@@ -78,6 +78,7 @@ def test_whatsapp_send_shows_destination_and_exact_message_before_sending():
     page.url = "https://web.whatsapp.com/"
     session = MagicMock()
     session.run_with_recovery.side_effect = lambda operation: operation(page)
+    session.page_for_site.return_value = ("1", page)
     tool.session = session
     row = MagicMock()
     row.inner_text.return_value = "Alice\nLast preview"
@@ -93,6 +94,33 @@ def test_whatsapp_send_shows_destination_and_exact_message_before_sending():
     assert "Hello — please call me." in prompt
     assert "unsent" in prompt
     assert session.run_with_recovery.call_count == 1
+
+
+def test_whatsapp_last_message_status_uses_visible_receipt_result():
+    module = _load_plugin("whatsapp")
+    tool = module.WhatsAppLastMessageStatusTool()
+    page = MagicMock()
+    page.url = "https://web.whatsapp.com/"
+    session = MagicMock()
+    session.run_with_recovery.side_effect = lambda operation: operation(page)
+    session.page_for_site.return_value = ("1", page)
+    session.active_tab_id.return_value = "1"
+    tool.session = session
+    row = MagicMock()
+
+    with patch.object(module, "_require_ready", return_value=None), patch.object(
+        module, "_find_chat", return_value=row
+    ), patch.object(
+        module, "_active_chat_header", return_value="Alice"), patch.object(
+        module, "_last_outgoing_message_status", return_value={
+            "delivery": "read", "text": "Hello", "timestamp": "[10:00] "
+        }
+    ):
+        result = tool.run("Alice")
+
+    assert result["status"] == "read"
+    assert result["contact"] == "Alice"
+    assert result["last_message"] == "Hello"
 
 
 def test_google_confirm_gated_tools_deny_before_api_client_access():
@@ -194,13 +222,19 @@ def test_playwright_session_start_is_mocked(tmp_path):
     session = module.BrowserSession(tmp_path)
     fake_playwright = MagicMock()
     fake_page = MagicMock()
-    fake_playwright.chromium.launch.return_value.new_page.return_value = fake_page
+    fake_context = fake_playwright.chromium.launch_persistent_context.return_value
+    fake_context.pages = []
+    fake_context.new_page.return_value = fake_page
     with patch("playwright.sync_api.sync_playwright") as sync_playwright:
         sync_playwright.return_value.start.return_value = fake_playwright
         page = session.get_page()
 
     assert page is fake_page
-    fake_playwright.chromium.launch.assert_called_once()
+    fake_playwright.chromium.launch_persistent_context.assert_called_once_with(
+        user_data_dir=str(tmp_path / "data" / "browser_profile"),
+        headless=True,
+        accept_downloads=True,
+    )
 
 
 def test_clipboard_calls_are_mocked():

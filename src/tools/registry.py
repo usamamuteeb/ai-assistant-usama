@@ -12,7 +12,17 @@ from typing import Any
 
 from .base import Tool
 from .filesystem_tool import FilesystemTool
-from .memory_tool import MemorySearchTool
+from .memory_tool import (
+    ForgetFactTool,
+    LogEpisodeTool,
+    MemorySearchTool,
+    RecallEpisodesTool,
+    RecallFactsTool,
+    RecallProcedureTool,
+    RememberFactTool,
+)
+from ..memory.store import SqliteStore
+from ..memory.vector_store import VectorMemory
 from .shell_tool import ShellTool
 
 
@@ -58,8 +68,29 @@ def load_plugins(plugins_dir: Path, confirm_fn=None) -> list[Tool]:
     return discovered
 
 
-def build_registry(settings, vector_store, confirm_fn=None) -> ToolRegistry:
+def build_registry(
+    settings,
+    vector_store,
+    confirm_fn=None,
+    *,
+    semantic_memory=None,
+    episodic_memory=None,
+    procedure_signatures=None,
+    store=None,
+) -> ToolRegistry:
     from ..config import Settings  # noqa: F401  (type hint only, avoids circular import at module load)
+
+    retrieval_config = getattr(settings, "memory_retrieval", None)
+    if not isinstance(retrieval_config, dict):
+        raw_config = getattr(settings, "raw", {})
+        retrieval_config = raw_config.get("memory_retrieval", {}) if isinstance(raw_config, dict) else {}
+    procedure_config = retrieval_config.get("procedural_memory", {}) if isinstance(retrieval_config, dict) else {}
+    semantic_memory = semantic_memory or VectorMemory(settings.chroma_path(), "semantic_memory")
+    episodic_memory = episodic_memory or VectorMemory(settings.chroma_path(), "episodic_memory")
+    procedure_signatures = procedure_signatures or VectorMemory(
+        settings.chroma_path(), "procedure_signatures", distance_space="cosine"
+    )
+    store = store or SqliteStore(settings.sqlite_path())
 
     built_in: list[Tool] = [
         FilesystemTool(
@@ -72,7 +103,18 @@ def build_registry(settings, vector_store, confirm_fn=None) -> ToolRegistry:
             require_confirmation=settings.shell_tool.get("require_confirmation", True),
             confirm_fn=confirm_fn,
         ),
-        MemorySearchTool(vector_store=vector_store),
+        MemorySearchTool(vector_store=vector_store, retrieval_config=retrieval_config),
+        RememberFactTool(semantic_memory),
+        RecallFactsTool(semantic_memory, retrieval_config=retrieval_config),
+        ForgetFactTool(semantic_memory, retrieval_config=retrieval_config),
+        LogEpisodeTool(episodic_memory),
+        RecallEpisodesTool(episodic_memory, retrieval_config=retrieval_config),
+        RecallProcedureTool(
+            procedure_signatures,
+            store,
+            retrieval_config=retrieval_config,
+            similarity_threshold=procedure_config.get("similarity_threshold", 0.85),
+        ),
     ]
 
     plugin_tools = load_plugins(settings.root / "plugins", confirm_fn=confirm_fn)

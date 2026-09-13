@@ -526,30 +526,36 @@ def _render_history(chat_log: ui.column, history: list[dict[str, Any]]) -> None:
     chat_log.clear()
     with chat_log:
         if not history:
-            with ui.column().classes("assistant-empty"):
-                ui.icon("auto_awesome").classes("assistant-empty-icon")
-                ui.label("Your workspace assistant is ready").classes("assistant-empty-title")
-                ui.label("Ask a question, plan a task, or request an action.").classes("assistant-empty-copy")
+            # Keep an empty conversation surface genuinely empty. The composer
+            # is the starting point, so a large onboarding card only consumes
+            # useful chat space once the interface is familiar.
             return
-        for entry in history:
+        for index, entry in enumerate(history):
             sent = entry["role"] == "user"
             rendered_image_paths = list(entry.get("images", [])) if not sent else []
             message_class = "message-user" if sent else "message-assistant"
             if rendered_image_paths:
                 message_class += " message-with-image"
-            with ui.chat_message(
-                name="You" if sent else "Assistant",
-                sent=sent,
-            ).classes(f"assistant-message {message_class}"):
-                ui.markdown(_chat_markdown(entry["content"], rendered_image_paths)).classes("chat-markdown")
-                if not sent and entry.get("model_used"):
-                    ui.label(f"via {entry['model_used']}").classes("model-used-caption")
-                if not sent:
-                    for image_path in entry.get("images", []):
-                        image_url = _static_image_url(image_path)
-                        if image_url:
-                            with ui.link("", image_url, new_tab=True).classes("chat-image-link"):
-                                ui.image(image_url).classes("chat-image")
+            # History is re-rendered as a whole. Animate only its newest item
+            # so fresh replies feel responsive without replaying motion for
+            # the rest of the conversation on each UI refresh.
+            if index == len(history) - 1:
+                message_class += " message-enter"
+            with ui.column().classes(f"assistant-message {message_class}"):
+                ui.label("You" if sent else "Assistant").classes("chat-role-label")
+                # Keep reply content, generated media, and its routing label in one
+                # visual bubble. NiceGUI's default chat-message creates a separate
+                # bubble for each child, which previously split the model label out.
+                with ui.column().classes("chat-bubble"):
+                    ui.markdown(_chat_markdown(entry["content"], rendered_image_paths)).classes("chat-markdown")
+                    if not sent:
+                        for image_path in entry.get("images", []):
+                            image_url = _static_image_url(image_path)
+                            if image_url:
+                                with ui.link("", image_url, new_tab=True).classes("chat-image-link"):
+                                    ui.image(image_url).classes("chat-image")
+                    if not sent and entry.get("model_used"):
+                        ui.label(f"via {entry['model_used']}").classes("model-used-caption")
 
 
 def _show_confirmation(session_id: str, dialog_holder: dict[str, Any]) -> None:
@@ -561,7 +567,7 @@ def _show_confirmation(session_id: str, dialog_holder: dict[str, Any]) -> None:
 
     dialog = ui.dialog()
     dialog_holder["dialog"] = dialog
-    with dialog, ui.card().classes("min-w-[28rem]"):
+    with dialog, ui.card().classes("min-w-[28rem] approval-dialog-card"):
         ui.label("Approval required").classes("text-lg font-semibold")
         ui.label("The assistant wants to run:")
         ui.code(pending["command"]).classes("w-full whitespace-pre-wrap")
@@ -682,7 +688,7 @@ def main() -> None:
         .assistant-compose-row { width: 100%; gap: .7rem; }
         .assistant-compose-icon { margin-left: .25rem; color: #d1202c; }
         .assistant-input-field { background: #292a2e; border-radius: 11px; }
-        .assistant-input-field .q-field__control { background: #292a2e !important; min-height: 50px; border: 1px solid rgba(255,255,255,.09); border-radius: 11px; transition: border-color .2s, box-shadow .2s; }
+        .assistant-input-field .q-field__control { background: #292a2e !important; min-height: 50px; border: 1px solid rgba(255,255,255,.09); border-radius: 11px; }
         .assistant-input-field.q-field--focused .q-field__control { border-color: #d1202c; box-shadow: 0 0 0 3px rgba(209,32,44,.13); }
         .assistant-input-field input, .assistant-input-field .q-field__native { color: #f8fafc !important; -webkit-text-fill-color: #f8fafc !important; caret-color: #fff !important; opacity: 1 !important; }
         .assistant-input-field input::placeholder { color: #9da4af !important; opacity: 1; }
@@ -757,6 +763,153 @@ def main() -> None:
             .assistant-header, .assistant-chat { width: min(760px, calc(100% - 2rem)); }
         }
     """)
+    ui.add_css("""
+        :root {
+            --space-1: 4px;
+            --space-2: 8px;
+            --space-3: 16px;
+            --space-4: 24px;
+            --radius: 10px;
+            --elevation: 0 2px 8px rgba(0,0,0,.40);
+        }
+        body, .q-page, .q-page-container, .q-layout {
+            background:
+                radial-gradient(circle at 50% -12%, rgba(126, 23, 33, .16), transparent 34rem),
+                linear-gradient(145deg, #0d0d0d 0%, #111010 52%, #161010 100%);
+        }
+        .q-drawer { background: linear-gradient(180deg, rgba(31,32,35,.97), rgba(22,22,24,.98)); }
+        .sidebar-content { gap: var(--space-3); }
+        .sidebar-card, .image-setup-card, .activity-event, .assistant-empty,
+        .chat-bubble, .assistant-input {
+            border-radius: var(--radius);
+            box-shadow: var(--elevation);
+        }
+        .sidebar-card { padding: var(--space-3); background: rgba(255,255,255,.032); }
+        .sidebar-card-title, .sidebar-section-label {
+            margin-bottom: var(--space-2);
+            font-size: .76rem;
+            letter-spacing: .09em;
+        }
+        .sidebar-subsection-label { margin: var(--space-3) 0 var(--space-1); }
+        .assistant-brand { margin: var(--space-1) 0 var(--space-3); }
+        .assistant-brand-mark, .sidebar-toggle { border-radius: var(--radius); }
+        .assistant-tier .q-field__control, .assistant-input-field,
+        .assistant-input-field .q-field__control, .knowledge-upload-zone,
+        .knowledge-upload, .knowledge-file-list, .knowledge-file,
+        .productivity-item, .chat-image, .chat-markdown pre,
+        .chat-markdown table, .approval-toggle, .image-setup-log {
+            border-radius: var(--radius);
+        }
+        .assistant-header, .assistant-chat { width: min(1180px, calc(100% - 3rem)); }
+        .assistant-header { margin-top: var(--space-4); margin-bottom: var(--space-2); }
+        .assistant-chat { gap: var(--space-3); padding-top: var(--space-3); }
+        .assistant-input { right: 360px; border-radius: 0; }
+        .assistant-input.left-sidebar-open { left: 280px; }
+        .assistant-compose-inner { width: min(1180px, 100%); }
+        .assistant-send, .knowledge-reindex, .image-setup-retry,
+        .q-btn:not(.q-btn--round) { border-radius: var(--radius); }
+        .knowledge-upload-zone { padding: var(--space-2); background: rgba(209,32,44,.025); }
+        .knowledge-file-list, .productivity-list {
+            gap: var(--space-1);
+            padding: var(--space-2);
+            border: 1px solid rgba(255,255,255,.07);
+            background: rgba(0,0,0,.14);
+            border-radius: var(--radius);
+        }
+        .knowledge-file, .productivity-item { padding: var(--space-2); border-radius: var(--radius); }
+        .productivity-card { gap: var(--space-2); }
+        .activity-feed { gap: var(--space-2); padding: var(--space-3) 0; }
+        .activity-event { padding: var(--space-3); border-radius: var(--radius); }
+        .image-setup-card { padding: var(--space-3); border-radius: var(--radius); }
+        .assistant-status, .activity-live { box-shadow: 0 0 0 1px rgba(105,223,153,.05); }
+        .voice-output-toggle { color: #8e96a2; }
+        .voice-output-toggle.is-active { color: #ff5661; background: rgba(209,32,44,.14); }
+        .voice-output-toggle .q-icon { font-size: 1.12rem; }
+        .assistant-header { flex-wrap: wrap !important; column-gap: var(--space-3); row-gap: var(--space-2); }
+        .sidebar-toggle { position: relative; z-index: 2; margin-right: var(--space-2); pointer-events: auto; }
+        .neural-logo { margin-left: var(--space-1); color: #ff4d57; pointer-events: none; filter: drop-shadow(0 0 8px rgba(209,32,44,.26)); }
+        .header-behavior-controls { min-width: 0; gap: var(--space-2); }
+        .header-approval-toggle { flex: 0 0 auto; max-width: 136px; overflow: hidden; }
+        .header-approval-toggle .q-btn { min-height: 34px; padding: 0 .55rem; font-size: .68rem; }
+        .header-tier { width: 160px; min-width: 0; }
+        .header-tier .q-field__control { min-height: 38px; background: rgba(36,37,41,.94); border-radius: var(--radius); }
+        .header-tier .q-field__control-container { padding-top: 0 !important; }
+        .header-tier .q-field__native, .header-tier .q-field__native > span {
+            min-height: 38px;
+            display: flex;
+            align-items: center;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .assistant-status.service-ready { color: #9ce3ba; border-color: rgba(105,223,153,.24); background: rgba(74,222,128,.08); }
+        .assistant-status.service-starting, .assistant-status.service-processing { color: #f7db7c; border-color: rgba(242,201,76,.34); background: rgba(242,201,76,.08); }
+        .assistant-status.service-failed, .assistant-status.service-not_installed, .assistant-status.service-unknown { color: #ff9aa1; border-color: rgba(255,89,99,.32); background: rgba(209,32,44,.08); }
+        .assistant-status.service-starting .assistant-status-dot, .assistant-status.service-processing .assistant-status-dot { color: #f2c94c; }
+        .assistant-status.service-failed .assistant-status-dot, .assistant-status.service-not_installed .assistant-status-dot, .assistant-status.service-unknown .assistant-status-dot { color: #ff6670; }
+        .assistant-message { width: 100%; gap: var(--space-1); }
+        .assistant-message.message-user { align-items: flex-end; }
+        .assistant-message.message-assistant { align-items: flex-start; }
+        .chat-role-label { margin: 0 .3rem; color: #aeb4be; font-size: .7rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+        .chat-bubble { width: fit-content; max-width: min(90%, 1040px); gap: var(--space-2); padding: .95rem 1rem; border: 1px solid rgba(255,255,255,.06); }
+        .message-assistant .chat-bubble { background: linear-gradient(145deg, #282a2e, #202226); color: #f5f6f8; }
+        .message-user .chat-bubble { background: linear-gradient(145deg, #681e25, #401217); border-color: rgba(255,101,112,.18); color: #fff; }
+        .model-used-caption { width: 100%; margin: var(--space-1) 0 0; padding-top: var(--space-2); border-top: 1px solid rgba(255,255,255,.08); color: #9299a4; font-size: .66rem; letter-spacing: .015em; }
+        .chat-image-link { max-width: 620px; margin: var(--space-2) 0 0; }
+        .chat-image { max-width: 620px; }
+        .knowledge-base { gap: var(--space-2); }
+        .knowledge-upload-compact { width: auto; min-width: 54px; border: 1px solid rgba(209,32,44,.38); background: rgba(209,32,44,.08); }
+        .knowledge-upload-compact .q-uploader__header { min-height: 34px; padding: 0 .15rem; background: transparent; }
+        .knowledge-upload-compact .q-uploader__title,
+        .knowledge-upload-compact .q-uploader__subtitle { display: none; }
+        .knowledge-upload-compact .q-btn { min-height: 34px; min-width: 34px; color: #fff; }
+        .knowledge-reindex { width: auto; min-height: 34px; margin-top: 0; padding: 0 .7rem; font-size: .7rem; }
+        .image-setup-detail { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        .productivity-item { align-items: flex-start; }
+        .productivity-item-content { flex: 1 1 auto; min-width: 0; }
+        .productivity-item-title {
+            width: 100%;
+            display: -webkit-box;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+            overflow: hidden;
+            white-space: normal;
+            line-height: 1.35;
+        }
+        .productivity-item-meta { margin-top: 2px; }
+        .approval-dialog-card { border: 1px solid rgba(209,32,44,.34); border-radius: var(--radius); box-shadow: 0 20px 48px rgba(0,0,0,.48); }
+        .q-dialog__backdrop { backdrop-filter: blur(3px); }
+        .q-spinner { color: var(--crimson) !important; }
+        @media (prefers-reduced-motion: no-preference) {
+            .q-page-container { transition: padding-left 220ms ease-out, padding-right 220ms ease-out; }
+            .assistant-sidebar, .assistant-activity-drawer { transition: transform 220ms ease-out, width 220ms ease-out; }
+            .assistant-input { transition: left 220ms ease-out, right 220ms ease-out, box-shadow 180ms ease-out; }
+            .assistant-input-field .q-field__control { transition: border-color 180ms ease-out, box-shadow 180ms ease-out; }
+            .q-btn { transition: transform 120ms ease-out, filter 120ms ease-out, box-shadow 120ms ease-out; }
+            .q-btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
+            .q-btn:active { filter: brightness(.94); transform: translateY(0) scale(.98); }
+            .message-enter { animation: message-enter 180ms ease-out both; }
+            .activity-enter { animation: activity-enter 170ms ease-out both; }
+            .approval-dialog-card { animation: approval-enter 150ms ease-out both; }
+            .assistant-status.service-ready { animation: live-pulse 2s ease-in-out infinite; }
+            @keyframes message-enter { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+            @keyframes activity-enter { from { opacity: 0; transform: translateY(-7px); } to { opacity: 1; transform: translateY(0); } }
+            @keyframes approval-enter { from { opacity: 0; transform: scale(.95); } to { opacity: 1; transform: scale(1); } }
+            @keyframes live-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(105,223,153,.07); } 50% { box-shadow: 0 0 14px 2px rgba(105,223,153,.16); } }
+        }
+        @media (max-width: 1200px) and (min-width: 901px) {
+            .assistant-header, .assistant-chat { width: calc(100% - 2rem); }
+            .assistant-header { flex-wrap: wrap !important; row-gap: var(--space-2); }
+        }
+        @media (max-width: 900px) {
+            .assistant-input { right: 0; }
+        }
+        @media (max-width: 700px) {
+            .assistant-header { width: calc(100% - 1.5rem); }
+            .header-behavior-controls { width: 100%; flex-wrap: wrap !important; justify-content: flex-end; }
+            .header-tier { flex: 1 1 145px; }
+        }
+    """)
 
     ingest_tool = getattr(orchestrator.tools, "_tools", {}).get("ingest_knowledge_base")
     knowledge_base_dir = getattr(ingest_tool, "knowledge_base_dir", _ui_settings.workspace_root() / "knowledge_base")
@@ -824,17 +977,11 @@ def main() -> None:
             reindex_button.enable()
 
     def refresh_knowledge_file_list() -> None:
-        knowledge_file_list.clear()
-        with knowledge_file_list:
-            files = indexed_knowledge_files()
-            if not files:
-                ui.label("No indexed documents yet.").classes("setting-copy")
-            for filename in files:
-                with ui.row().classes("knowledge-file items-center no-wrap"):
-                    ui.icon("check_circle")
-                    with ui.element("div").classes("knowledge-file-name-wrap"):
-                        ui.label(filename).classes("knowledge-file-name")
-                        ui.tooltip(filename).classes("knowledge-file-tooltip")
+        # The document list remains available through the knowledge-base tools,
+        # but is intentionally not rendered in the compact sidebar treatment.
+        # Keep this hook so upload, re-index, and folder-watch flows do not
+        # need any functional changes when they refresh the presentation.
+        return
 
     watch_notification_state = {"seen": 0}
 
@@ -916,94 +1063,80 @@ def main() -> None:
             productivity_state["signature"] = signature
             task_panel.clear()
             with task_panel:
-                ui.label("Tasks & Reminders").classes("sidebar-card-title")
-                ui.label("Ask the assistant to create, update, or remind you.").classes("productivity-copy")
+                task_title = ui.label("Tasks & Reminders").classes("sidebar-card-title")
+                task_title.tooltip("Ask the assistant to create, update, or remind you.")
                 ui.label("OPEN TASKS").classes("sidebar-subsection-label")
                 with ui.column().classes("productivity-list"):
                     if not tasks:
                         ui.label("No open tasks.").classes("productivity-empty")
                     for task in tasks:
-                        with ui.row().classes("productivity-item items-center no-wrap"):
+                        with ui.row().classes("productivity-item items-start no-wrap"):
                             ui.icon("check_box_outline_blank").classes("productivity-item-icon")
-                            ui.label(str(task.get("title") or task.get("description", ""))).classes("productivity-item-title")
-                            if task.get("due_at"):
-                                ui.label(_local_time(task["due_at"])).classes("productivity-item-meta")
+                            with ui.column().classes("productivity-item-content gap-0"):
+                                ui.label(str(task.get("title") or task.get("description", ""))).classes("productivity-item-title")
+                                if task.get("due_at"):
+                                    ui.label(_local_time(task["due_at"])).classes("productivity-item-meta")
                 ui.label("UPCOMING REMINDERS").classes("sidebar-subsection-label")
                 with ui.column().classes("productivity-list"):
                     if not reminders:
                         ui.label("No upcoming reminders.").classes("productivity-empty")
                     for reminder in reminders:
-                        with ui.row().classes("productivity-item items-center no-wrap"):
+                        with ui.row().classes("productivity-item items-start no-wrap"):
                             ui.icon("notifications_none").classes("productivity-item-icon")
-                            ui.label(str(reminder.get("message", ""))).classes("productivity-item-title")
-                            ui.label(_local_time(reminder.get("remind_at"))).classes("productivity-item-meta")
+                            with ui.column().classes("productivity-item-content gap-0"):
+                                ui.label(str(reminder.get("message", ""))).classes("productivity-item-title")
+                                ui.label(_local_time(reminder.get("remind_at"))).classes("productivity-item-meta")
                 ui.label("RECENTLY DELIVERED").classes("sidebar-subsection-label")
                 with ui.column().classes("productivity-list"):
                     if not recent_delivered:
                         ui.label("No reminders delivered yet.").classes("productivity-empty")
                     for reminder in reversed(recent_delivered):
-                        with ui.row().classes("productivity-item items-center no-wrap"):
+                        with ui.row().classes("productivity-item items-start no-wrap"):
                             ui.icon("check_circle").classes("productivity-item-icon productivity-item-delivered")
-                            ui.label(str(reminder.get("message", ""))).classes("productivity-item-title")
-                            ui.label(_local_time(reminder.get("remind_at"))).classes("productivity-item-meta")
+                            with ui.column().classes("productivity-item-content gap-0"):
+                                ui.label(str(reminder.get("message", ""))).classes("productivity-item-title")
+                                ui.label(_local_time(reminder.get("remind_at"))).classes("productivity-item-meta")
         except Exception as exc:
             logger.warning("Could not refresh tasks and reminders: %s", exc)
 
-    left_sidebar = ui.left_drawer(value=bool(client["left_sidebar_visible"])).props("behavior=desktop width=300").classes("p-5 assistant-sidebar")
-    with left_sidebar:
-        with ui.row().classes("assistant-brand items-center no-wrap"):
-            with ui.element("div").classes("assistant-brand-mark"):
-                ui.icon("auto_awesome")
-            with ui.column().classes("gap-0"):
-                ui.label("Personal AI").classes("assistant-brand-name")
-                ui.label("Workspace assistant").classes("assistant-brand-copy")
-        ui.separator().style("background: rgba(255,255,255,.08);")
-        with ui.column().classes("sidebar-content"):
-            with ui.column().classes("sidebar-card"):
-                ui.label("Model Routing").classes("sidebar-card-title")
-                ui.label("Choose when assistant actions need your review.").classes("setting-copy")
-                ui.label("Approval mode").classes("sidebar-subsection-label")
-                ui.toggle(
-                    APPROVAL_MODES,
-                    value=client["approval_mode"],
-                    on_change=lambda e: (client.__setitem__("approval_mode", e.value),
-                                         _approval_modes.__setitem__(session_id, e.value)),
-                ).props("inline").classes("approval-toggle")
-                ui.label("Model tier").classes("sidebar-subsection-label")
-                ui.select(MODEL_OPTIONS, value=client["selected_tier"], label="Model",
-                          on_change=lambda e: client.__setitem__("selected_tier", e.value)).classes("w-full assistant-tier")
+    read_aloud_toggle: Any | None = None
 
-            with ui.column().classes("sidebar-card"):
-                ui.label("Read Replies Aloud").classes("sidebar-card-title")
-                ui.label("Play completed assistant replies through your default audio device.").classes("setting-copy")
-                ui.checkbox(
-                    "Read replies aloud",
-                    value=client["read_replies_aloud"],
-                    on_change=lambda e: client.__setitem__("read_replies_aloud", e.value),
-                ).classes("voice-output-toggle")
+    def toggle_read_replies_aloud() -> None:
+        enabled = not bool(client["read_replies_aloud"])
+        client["read_replies_aloud"] = enabled
+        if read_aloud_toggle is not None:
+            read_aloud_toggle.set_icon("volume_up" if enabled else "volume_off")
+            read_aloud_toggle.classes(
+                add="is-active" if enabled else "",
+                remove="" if enabled else "is-active",
+            )
+
+    left_sidebar = ui.left_drawer(value=bool(client["left_sidebar_visible"])).props("behavior=desktop width=280").classes("p-4 assistant-sidebar")
+    with left_sidebar:
+        with ui.column().classes("sidebar-content"):
+            task_panel = ui.column().classes("sidebar-card productivity-card")
+            refresh_productivity_panel()
 
             with ui.column().classes("sidebar-card knowledge-base"):
-                ui.label("Knowledge Base").classes("sidebar-card-title")
-                ui.label("Upload documents for local semantic search.").classes("setting-copy")
-                with ui.column().classes("knowledge-upload-zone"):
+                with ui.row().classes("items-center no-wrap w-full"):
+                    knowledge_title = ui.label("Knowledge Base").classes("sidebar-card-title")
+                    ui.space()
                     knowledge_upload = ui.upload(
                         on_upload=save_knowledge_file,
                         auto_upload=True,
-                    ).props('accept=".pdf,.txt,.md,.docx,.xlsx,.pptx"').classes("knowledge-upload")
-                knowledge_file_list = ui.column().classes("knowledge-file-list")
-                refresh_knowledge_file_list()
+                        label="Add",
+                    ).props('accept=".pdf,.txt,.md,.docx,.xlsx,.pptx"').classes("knowledge-upload knowledge-upload-compact")
+                knowledge_title.tooltip("Upload documents for local semantic search.")
+                knowledge_upload.tooltip("Add PDF, TXT, Markdown, DOCX, XLSX, or PPTX documents.")
                 with ui.row().classes("items-center no-wrap w-full"):
                     reindex_button = ui.button(
-                        "Re-index Knowledge Base",
+                        "Re-index",
                         icon="sync",
                         color="primary",
                         on_click=reindex_knowledge_base,
-                    ).classes("knowledge-reindex")
+                    ).props("dense no-caps").classes("knowledge-reindex")
                     reindex_spinner = ui.spinner("dots", size="sm", color="primary")
                     reindex_spinner.set_visibility(False)
-
-            task_panel = ui.column().classes("sidebar-card productivity-card")
-            refresh_productivity_panel()
 
     activity_render_state = {"signature": ""}
 
@@ -1025,9 +1158,10 @@ def main() -> None:
                 "done": "check_circle",
                 "error": "error_outline",
             }
-            for event in reversed(events):
+            for index, event in enumerate(reversed(events)):
                 status = event["status"]
-                with ui.row().classes(f"activity-event activity-event-{status} no-wrap"):
+                entry_class = " activity-enter" if index == 0 else ""
+                with ui.row().classes(f"activity-event activity-event-{status} no-wrap{entry_class}"):
                     ui.icon(icon_for_status.get(status, "info")).classes("activity-event-icon")
                     with ui.column().classes("gap-0 flex-grow"):
                         ui.label(event["title"]).classes("activity-event-title")
@@ -1040,6 +1174,29 @@ def main() -> None:
         render_activity()
 
     image_setup_render_state = {"signature": "", "busy": False}
+    header_status: Any | None = None
+    header_status_label: Any | None = None
+
+    def update_header_service_status(state: str) -> None:
+        """Reflect the live image-service probe in the header, not a fixed badge."""
+        if header_status is None or header_status_label is None:
+            return
+        labels = {
+            "ready": "READY",
+            "starting": "STARTING",
+            "processing": "WORKING",
+            "failed": "DEGRADED",
+            "not_installed": "SETUP REQUIRED",
+            "unknown": "CHECK STATUS",
+        }
+        header_status_label.set_text(labels.get(state, "CHECK STATUS"))
+        header_status.classes(
+            remove=(
+                "service-ready service-starting service-processing service-failed "
+                "service-not_installed service-unknown"
+            ),
+            add=f"service-{state}",
+        )
 
     def render_image_setup(snapshot: dict[str, Any]) -> None:
         signature = repr(snapshot)
@@ -1047,6 +1204,7 @@ def main() -> None:
             return
         image_setup_render_state["signature"] = signature
         state = str(snapshot.get("state", "unknown")).lower()
+        update_header_service_status(state)
         icon = {
             "ready": "check_circle",
             "processing": "downloading",
@@ -1065,13 +1223,6 @@ def main() -> None:
             if phase:
                 ui.label(f"Phase: {phase.title()}").classes("image-setup-meta")
             ui.label(str(snapshot.get("detail", "Status unavailable."))).classes("image-setup-detail")
-            updated_at = str(snapshot.get("updated_at", "")).strip()
-            if updated_at:
-                ui.label(f"Last update: {updated_at.replace('T', ' ').replace('+00:00', ' UTC')}").classes("image-setup-meta")
-            log_tail = snapshot.get("log_tail", [])
-            if isinstance(log_tail, list) and log_tail:
-                ui.label("Latest installer log").classes("image-setup-meta")
-                ui.label("\n".join(str(line) for line in log_tail)).classes("image-setup-log")
             if snapshot.get("can_retry"):
                 ui.button("Retry image setup", icon="refresh", color="primary", on_click=retry_image_setup).props("no-caps").classes("image-setup-retry")
 
@@ -1105,13 +1256,11 @@ def main() -> None:
             logger.exception("Could not retry image setup")
             ui.notify(f"Could not retry image setup: {exc}", type="negative")
 
-    with ui.right_drawer(value=True).props("behavior=desktop width=300").classes("p-5 assistant-activity-drawer"):
+    with ui.right_drawer(value=True).props("behavior=desktop width=360").classes("p-4 assistant-activity-drawer"):
         with ui.row().classes("activity-header items-start no-wrap"):
             with ui.column().classes("gap-0"):
-                ui.label("Live activity").classes("activity-title")
-                ui.label("Real-time assistant and tool progress").classes("activity-copy")
-            ui.space()
-            ui.label("LIVE").classes("activity-live")
+                activity_title = ui.label("Live activity").classes("activity-title")
+                activity_title.tooltip("Real-time assistant and tool progress")
         image_setup_card = ui.column().classes("image-setup-card")
         activity_feed = ui.column().classes("activity-feed")
         ui.button("Clear activity", icon="cleaning_services", on_click=clear_activity_feed).props("flat no-caps").classes("activity-clear")
@@ -1139,14 +1288,35 @@ def main() -> None:
             on_click=toggle_left_sidebar,
         ).props("flat round dense").classes("sidebar-toggle")
         left_sidebar_toggle.tooltip("Show or hide settings sidebar")
-        ui.icon("smart_toy").classes("assistant-header-icon")
+        ui.icon("rocket_launch").classes("assistant-header-icon neural-logo")
         with ui.column().classes("gap-0"):
-            ui.label("Personal AI Assistant").classes("assistant-title")
-            ui.label("A focused workspace for your tasks and tools").classes("assistant-subtitle")
+            ui.label("Neural").classes("assistant-title")
         ui.space()
-        with ui.row().classes("assistant-status items-center no-wrap"):
+        with ui.row().classes("header-behavior-controls items-center no-wrap"):
+            approval_toggle = ui.toggle(
+                APPROVAL_MODES,
+                value=client["approval_mode"],
+                on_change=lambda e: (client.__setitem__("approval_mode", e.value),
+                                     _approval_modes.__setitem__(session_id, e.value)),
+            ).props("inline dense").classes("approval-toggle header-approval-toggle")
+            approval_toggle.tooltip("Choose when assistant actions need your review.")
+            model_tier = ui.select(
+                MODEL_OPTIONS,
+                value=client["selected_tier"],
+                on_change=lambda e: client.__setitem__("selected_tier", e.value),
+            ).props("dense options-dense outlined aria-label='Model tier'").classes("header-tier")
+            model_tier.tooltip("Choose which model tier handles new requests.")
+            read_aloud_toggle = ui.button(
+                icon="volume_up" if client["read_replies_aloud"] else "volume_off",
+                on_click=toggle_read_replies_aloud,
+            ).props("flat round dense aria-label='Read replies aloud'").classes(
+                "voice-output-toggle" + (" is-active" if client["read_replies_aloud"] else "")
+            )
+            read_aloud_toggle.tooltip("Read replies aloud")
+        with ui.row().classes("assistant-status service-unknown items-center no-wrap") as header_status:
             ui.icon("circle").classes("assistant-status-dot")
-            ui.label("READY")
+            header_status_label = ui.label("CHECKING")
+        header_status.tooltip("Local image-generation service status. If the web UI itself stops, the browser disconnects instead of showing a stale status.")
     with ui.column().classes("assistant-chat") as chat_log:
         _render_history(chat_log, client["chat_history"])
 

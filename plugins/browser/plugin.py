@@ -60,6 +60,13 @@ class BrowserConfig:
         path = Path(str(configured)).expanduser()
         return path if path.is_absolute() else self.root / path
 
+    @property
+    def profile_dir(self) -> Path:
+        """Dedicated Playwright profile; never reuse the user's normal Chrome profile."""
+        configured = self.browser_data.get("profile_dir", "data/browser_profile")
+        path = Path(str(configured)).expanduser()
+        return path if path.is_absolute() else self.root / path
+
 
 class BrowserRecoveryError(RuntimeError):
     """Raised only after a crashed browser was restarted and retried once."""
@@ -84,6 +91,7 @@ class BrowserSession:
         self.config = BrowserConfig(root)
         self._playwright = None
         self._browser = None
+        self._context = None
         self._tabs: dict[str, Any] = {}
         self._active_tab_id: str | None = None
         self._next_tab_id = 1
@@ -99,28 +107,58 @@ class BrowserSession:
         from playwright.sync_api import sync_playwright
 
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=self.config.headless)
+        profile_dir = self.config.profile_dir
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        # A persistent context retains WhatsApp's browser storage after the
+        # first QR scan. It is deliberately project-local rather than the
+        # user's regular Chrome profile, which could be locked or expose
+        # unrelated browser data to automation.
+        self._context = self._playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            headless=self.config.headless,
+            accept_downloads=True,
+        )
+        self._browser = getattr(self._context, "browser", None)
         self._tabs = {}
         self._active_tab_id = None
         self._next_tab_id = 1
+        self._adopt_context_pages()
+
+    def _track_page(self, page: Any, make_active: bool = True) -> tuple[str, Any]:
+        for tab_id, tracked_page in self._tabs.items():
+            if tracked_page is page:
+                if make_active:
+                    self._active_tab_id = tab_id
+                return tab_id, page
+        tab_id = str(self._next_tab_id)
+        self._next_tab_id += 1
+        self._tabs[tab_id] = page
+        if make_active:
+            self._active_tab_id = tab_id
+        return tab_id, page
+
+    def _adopt_context_pages(self) -> None:
+        if self._context is None:
+            return
+        for page in self._context.pages:
+            self._track_page(page, make_active=self._active_tab_id is None)
 
     def _new_tab(self) -> tuple[str, Any]:
         with self._lock:
-            if self._browser is None:
+            if self._context is None:
                 self._launch()
-            tab_id = str(self._next_tab_id)
-            self._next_tab_id += 1
-            page = self._browser.new_page()
-            self._tabs[tab_id] = page
-            self._active_tab_id = tab_id
-            return tab_id, page
+            return self._track_page(self._context.new_page())
 
     def get_page(self):
         with self._lock:
-            if self._browser is None or self._playwright is None:
+            if self._context is None or self._playwright is None:
                 self._launch()
+            self._adopt_context_pages()
             if self._active_tab_id is None or self._active_tab_id not in self._tabs:
-                return self._new_tab()[1]
+                if self._tabs:
+                    self._active_tab_id = next(iter(self._tabs))
+                else:
+                    return self._new_tab()[1]
             page = self._tabs[self._active_tab_id]
             try:
                 if page.is_closed():
@@ -141,12 +179,50 @@ class BrowserSession:
             return self._new_tab()
         return str(self._active_tab_id), self.get_page()
 
+    def page_for_site(self, url_fragment: str) -> tuple[str, Any]:
+        """Reuse a matching site tab, then a blank page, before opening a tab.
+
+        This keeps a single WhatsApp Web tab instead of leaving an extra blank
+        tab behind when a previous browser action already created one.
+        """
+        with self._lock:
+            self.get_page()  # Ensures the persistent context and tab map exist.
+            needle = url_fragment.casefold()
+            for tab_id, page in self._tabs.items():
+                try:
+                    if needle in str(page.url).casefold() and not page.is_closed():
+                        self._active_tab_id = tab_id
+                        page.bring_to_front()
+                        return tab_id, page
+                except Exception:
+                    continue
+            active_page = self._tabs.get(self._active_tab_id or "")
+            if active_page is not None:
+                try:
+                    if str(active_page.url).lower() in {"", "about:blank"}:
+                        return str(self._active_tab_id), active_page
+                except Exception:
+                    pass
+            for tab_id, page in self._tabs.items():
+                try:
+                    if str(page.url).lower() in {"", "about:blank"} and not page.is_closed():
+                        self._active_tab_id = tab_id
+                        page.bring_to_front()
+                        return tab_id, page
+                except Exception:
+                    continue
+            return self._new_tab()
+
     def switch_tab(self, tab_id: str) -> bool:
         tab_id = str(tab_id)
         with self._lock:
             if tab_id not in self._tabs:
                 return False
             self._active_tab_id = tab_id
+            try:
+                self._tabs[tab_id].bring_to_front()
+            except Exception:
+                pass
             return True
 
     def close_tab(self, tab_id: str) -> bool:
@@ -210,9 +286,9 @@ class BrowserSession:
                     pass
             self._tabs = {}
             self._active_tab_id = None
-            if self._browser is not None:
+            if self._context is not None:
                 try:
-                    self._browser.close()
+                    self._context.close()
                 except Exception:
                     pass
             if self._playwright is not None:
@@ -221,6 +297,7 @@ class BrowserSession:
                 except Exception:
                     pass
             self._browser = None
+            self._context = None
             self._playwright = None
             self._next_tab_id = 1
 

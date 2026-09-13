@@ -69,6 +69,24 @@ def test_tabs_switch_and_active_read_calls(browser_session, tmp_path):
     assert "Beta" in text_tool.run()["text"]
 
 
+def test_site_tab_reuses_blank_tab_instead_of_creating_a_second_one(tmp_path):
+    session = BrowserSession(tmp_path)
+    blank_page = MagicMock()
+    blank_page.url = "about:blank"
+    blank_page.is_closed.return_value = False
+    session._context = MagicMock()
+    session._context.pages = []
+    session._playwright = MagicMock()
+    session._tabs = {"1": blank_page}
+    session._active_tab_id = "1"
+
+    tab_id, page = session.page_for_site("web.whatsapp.com")
+
+    assert tab_id == "1"
+    assert page is blank_page
+    session._context.new_page.assert_not_called()
+
+
 def test_form_upload_download_wait_and_pdf_export(browser_session, tmp_path):
     page_one, _ = _write_pages(tmp_path)
     BrowserOpenPageTool(root=tmp_path).run(page_one.as_uri())

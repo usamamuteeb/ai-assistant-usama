@@ -89,6 +89,25 @@ class Settings:
         return self.raw["memory"]
 
     @property
+    def memory_retrieval(self) -> dict[str, Any]:
+        defaults: dict[str, Any] = {
+            "similarity_weight": 0.6,
+            "recency_weight": 0.2,
+            "importance_weight": 0.2,
+            "half_life_days": 14,
+            "procedural_memory": {"similarity_threshold": 0.85},
+        }
+        configured = self.raw.get("memory_retrieval", {})
+        configured = configured if isinstance(configured, dict) else {}
+        merged = {**defaults, **configured}
+        procedural = configured.get("procedural_memory", {})
+        merged["procedural_memory"] = {
+            **defaults["procedural_memory"],
+            **(procedural if isinstance(procedural, dict) else {}),
+        }
+        return merged
+
+    @property
     def filesystem_tool(self) -> dict[str, Any]:
         return self.raw["filesystem_tool"]
 
