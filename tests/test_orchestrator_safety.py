@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.model_router import ChatResult, ToolCall
-from src.orchestrator import Orchestrator
+from src.orchestrator import Orchestrator, _summarize_tool_result
 
 
 class _ScriptedRouter:
@@ -93,6 +93,17 @@ def test_confirmation_denial_stops_after_one_model_call():
 
     assert len(assistant.router.calls) == 1
     assert "Waiting for your approval" in result.text
+
+
+def test_youtube_timeout_summary_does_not_dump_raw_api_dictionary():
+    value = str({
+        "query": "Data with Bara",
+        "result_type": "video",
+        "results": [{"title": "Latest video", "channel_title": "Data with Bara"}],
+    })
+    summary = _summarize_tool_result(value)
+    assert summary == "YouTube matches: Latest video (Data with Bara)"
+    assert "'results'" not in summary
 
 
 def test_duplicate_tool_calls_are_executed_only_once():

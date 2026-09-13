@@ -421,6 +421,69 @@ all message/event creation actions use the normal global confirmation mode.
 Because archiving requires the Gmail modify scope, an existing OAuth token may
 need to be authorized again after adding `gmail.modify` to `config.yaml`.
 
+## YouTube integration
+
+The optional YouTube plugin reuses the same encrypted Google OAuth session as
+Gmail and Calendar. It provides `youtube_status`, `youtube_search`,
+`youtube_get_video`, `youtube_get_channel`, `youtube_list_playlist_videos`,
+`youtube_channel_overview`,
+`youtube_list_subscriptions`, `youtube_list_my_playlists`,
+`youtube_open_in_browser`, `youtube_play`, `youtube_pause`, `youtube_resume`,
+`youtube_stop`, `youtube_set_volume`, and `youtube_seek`. `youtube_play` searches for a
+song or video, shows the selected title and URL for confirmation, then opens
+the persistent browser session and attempts to start the player.
+The playback controls operate on the already-open persistent browser player;
+they do not change the YouTube account.
+
+Personal organization and account tools include `youtube_create_playlist`,
+`youtube_add_to_playlist`, `youtube_remove_from_playlist`,
+`youtube_update_playlist`, `youtube_delete_playlist`,
+`youtube_subscribe_channel`, `youtube_unsubscribe_channel`,
+`youtube_rate_video`, and `youtube_get_video_rating`. Read tools include
+`youtube_list_comments`, `youtube_list_caption_tracks`,
+`youtube_get_transcript`, and `youtube_list_my_activities`. Creator tools
+include `youtube_upload_video`, `youtube_update_video`, and
+`youtube_delete_video`. Uploads default to private visibility and only accept
+local files inside the configured filesystem roots.
+
+All YouTube account-changing actions and uploads require the normal approval
+callback; deletion prompts include the video or playlist title and ID. The
+first feature that needs a new permission can request the additional OAuth
+scope; after approval it is cached in `data/google_token.json` so later
+sessions do not require signing in again. Enable the YouTube Data API in the
+same Google Cloud project used by `credentials.json`.
+
+The project starts with the read-only YouTube scope and requests account-
+management, force-SSL, or upload permission only when a feature needs it.
+Google may show a broader consent screen when a write or upload feature is
+first used. YouTube API quota and YouTube's own account restrictions still
+apply.
+
+### YouTube downloads
+
+The plugin also provides `youtube_download_video` and
+`youtube_download_audio`. Video output is always MP4 and defaults to up to
+720p; pass `quality: "low"` for up to 360p, `quality: "high"` for up to
+1080p, or a resolution such as `480p`. Audio output is always MP3, so no
+format selection is required. Downloads run as local background jobs;
+`youtube_download_status` reports percentage, speed, ETA, and the final path,
+while `youtube_cancel_download` stops an active job.
+
+The default destination is `C:\Users\HP\Downloads\Neural YouTube` and can be
+changed to another configured filesystem root. Every download requires normal
+confirmation showing the title, output type, quality, and destination. The
+implementation uses [yt-dlp](https://github.com/yt-dlp/yt-dlp); install
+[FFmpeg](https://ffmpeg.org/download.html) and ensure both `ffmpeg` and
+`ffprobe` are on PATH because MP3 conversion and high-quality MP4 merging need
+them. Use downloads only for content you own, have permission to use, or that
+YouTube explicitly makes available for download.
+
+`youtube_save_video_notes` writes a local Markdown note under the workspace
+knowledge-base folder. The web UI watcher can index it automatically while the
+web UI is running; CLI and scheduler users can re-index manually. YouTube API
+quota is subject to Google's daily project quota, so the plugin starts with
+read-oriented operations and does not silently perform uploads or publishing.
+
 ## Browser automation setup
 
 After `pip install -r requirements.txt`, you must also run this once in the project environment:

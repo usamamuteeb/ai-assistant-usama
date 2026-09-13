@@ -91,8 +91,47 @@ class VectorMemory:
                 matches.append({"id": doc_id, "text": document, "metadata": metadata or {}})
         return matches
 
-    def delete_memory(self, doc_id: str) -> None:
+    def delete_memory(self, doc_id: str) -> bool:
+        """Delete one entry and report whether it existed."""
+        existing = self.collection.get(ids=[doc_id], include=["metadatas"])
+        ids = existing.get("ids", [])
+        if not ids:
+            return False
         self.collection.delete(ids=[doc_id])
+        return True
+
+    def list_entries(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Return recent entries with stable ids for local memory management."""
+        limit = min(max(1, int(limit)), 100)
+        if self.collection.count() == 0:
+            return []
+        records = self.collection.get(limit=limit, include=["documents", "metadatas"])
+        entries = []
+        for doc_id, document, metadata in zip(
+            records.get("ids", []),
+            records.get("documents", []),
+            records.get("metadatas", []),
+        ):
+            entries.append(
+                {
+                    "id": doc_id,
+                    "text": document or "",
+                    "metadata": metadata or {},
+                }
+            )
+        return sorted(
+            entries,
+            key=lambda item: float((item.get("metadata") or {}).get("created_at", 0) or 0),
+            reverse=True,
+        )
+
+    def delete_where(self, where: dict[str, Any]) -> int:
+        """Delete all entries matching a simple Chroma metadata filter."""
+        records = self.collection.get(where=where, include=["metadatas"])
+        ids = records.get("ids", [])
+        if ids:
+            self.collection.delete(ids=ids)
+        return len(ids)
 
     def similarity_from_distance(self, distance: float) -> float:
         """Return a cosine similarity for cosine collections when available."""

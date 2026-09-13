@@ -6,6 +6,7 @@ elsewhere.
 """
 from __future__ import annotations
 
+import ast
 import concurrent.futures
 import json
 import re
@@ -16,7 +17,9 @@ from .config import Settings
 from .memory.store import SqliteStore
 from .memory.vector_store import VectorMemory
 from .model_router import ChatResult, ModelRouter
+from .memory.vector_store import blended_search
 from .tools.relevance import log_selection, select_relevant_tools
+from .tools.memory_tool import ListMemoriesTool, RemoveMemoryTool
 from .tools.registry import ToolRegistry, build_registry
 
 SYSTEM_PROMPT = """You are a personal AI assistant running locally on the user's machine.
@@ -31,6 +34,15 @@ If asked what you can do, what features or tools you have, or similar meta-quest
 your own capabilities, answer directly from your knowledge of the tools available in this
 conversation. Do not call tools to answer capability questions. Only call tools when the
 user is asking you to actually do or look up something.
+For YouTube questions about a named channel and its latest videos, use
+youtube_channel_overview once; do not repeat youtube_search with progressively similar queries.
+For YouTube download requests, use youtube_download_video for the fixed MP4 output or
+youtube_download_audio for the fixed MP3 output. Video quality defaults to 720p; pass low for
+360p or high for up to 1080p when the user asks for a quality level. Do not claim YouTube
+downloads are unavailable when these tools are present. Use youtube_download_status to check a
+started job and youtube_cancel_download when the user asks to stop one.
+After receiving tool data, synthesize a direct answer in normal prose and never expose raw Python
+dictionaries or internal tool payloads to the user.
 Tools are either confirmation-gated or not. If a tool is available and is not confirmation-
 gated (most read actions and content-generation actions such as image generation are not),
 call it directly. Do not ask the user "shall I proceed?" before attempting it. Only the
@@ -50,11 +62,34 @@ genuinely significant outcomes (a decision made, a problem solved, a milestone r
 exchange. Before starting a multi-step task, consider calling recall_procedure to check if a similar
 task has a known successful sequence — but always adapt it to the current request rather than blindly
 repeating it.
+If the user's message contains explicit memory-directives such as "remember this", "remember that",
+"always", "from now on", "I prefer", "keep this in mind", or similar wording, you MUST call
+remember_fact for that content. This overrides the general "use sparingly" guidance because the
+user directly requested memory; the sparse-use rule applies only to your own judgment calls.
 """
 
 MAX_TOOL_ITERATIONS = 10
 MAX_TOOL_LOOP_SECONDS = 45
 TOOL_CALL_HARD_TIMEOUT_SECONDS = 150
+_REMEMBER_FACT_TRIGGER_RE = re.compile(
+    r"\b(?:remember\s+(?:this|that)|always|from\s+now\s+on|i\s+prefer|keep\s+this\s+in\s+mind)\b",
+    re.IGNORECASE,
+)
+_PRERECALL_RE = re.compile(
+    r"\b(?:prefer|favorite|usually|remind\s+me|what\s+did\s+i\s+say\s+about|remember)\b",
+    re.IGNORECASE,
+)
+_QUESTION_START_RE = re.compile(
+    r"^\s*(?:who|what|when|where|which|why|how|can|could|would|do|does|did|is|are)\b",
+    re.IGNORECASE,
+)
+_VAGUE_PROCEDURE_SIGNATURES = {
+    "try again",
+    "retry",
+    "do it again",
+    "same thing",
+    "continue",
+}
 _IMAGE_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.(?:png|jpe?g|gif|webp)(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -85,6 +120,21 @@ def _image_paths_from_result(value: Any) -> list[str]:
 
 def _summarize_tool_result(value: Any, limit: int = 300) -> str:
     text = str(value)
+    # If a watchdog ever catches a tool loop mid-flight, keep the fallback
+    # readable instead of exposing the full repr() of a YouTube API response.
+    if "'result_type': 'video'" in text and "'results':" in text:
+        try:
+            parsed = ast.literal_eval(text)
+            rows = parsed.get("results", []) if isinstance(parsed, dict) else []
+            compact = [
+                f"{row.get('title', 'Untitled')} ({row.get('channel_title') or 'unknown channel'})"
+                for row in rows[:5]
+                if isinstance(row, dict)
+            ]
+            if compact:
+                return "YouTube matches: " + "; ".join(compact)
+        except (ValueError, SyntaxError):
+            pass
     if text.lower().strip().startswith("{\"error\"") or "error" in text.lower() and "confirmation denied" not in text.lower():
         return ""
     return text[:limit].rstrip() + ("..." if len(text) > limit else "")
@@ -130,6 +180,23 @@ class Orchestrator:
             procedure_signatures=self.procedure_signatures,
             store=self.store,
         )
+        # Keep registry.py unchanged per the memory-management rollout scope;
+        # these are still core tools on the same registry object, never plugins.
+        for tool in (
+            ListMemoriesTool(
+                self.semantic_memory,
+                self.episodic_memory,
+                self.procedure_signatures,
+                self.store,
+            ),
+            RemoveMemoryTool(
+                self.semantic_memory,
+                self.episodic_memory,
+                self.procedure_signatures,
+                self.store,
+            ),
+        ):
+            self.tools._tools[tool.name] = tool
         self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self._last_model_used: dict[str, str] = {}
         self._last_images: dict[str, list[str]] = {}
@@ -159,9 +226,12 @@ class Orchestrator:
         )
         messages: list[dict[str, Any]] = [{"role": h["role"], "content": h["content"]} for h in history]
 
+        system_prompt = SYSTEM_PROMPT + self._prerecall_facts(user_message)
+
         anthropic_tools = self.tools.anthropic_tools()
         image_paths: list[str] = []
         tool_call_trace: list[str] = []
+        turn_state: dict[str, Any] = {"had_tool_error": False, "hit_limit": False}
         final_result = self._run_tool_loop(
             tier,
             messages,
@@ -170,10 +240,15 @@ class Orchestrator:
             force_chain_start_index=force_chain_start_index,
             image_paths=image_paths,
             tool_call_trace=tool_call_trace,
+            system_prompt=system_prompt,
+            turn_state=turn_state,
         )
         self._last_model_used[session_id] = final_result.model_used or "unknown"
         self._last_images[session_id] = list(dict.fromkeys(image_paths))
         final_text = final_result.text
+
+        if _REMEMBER_FACT_TRIGGER_RE.search(user_message) and "remember_fact" not in tool_call_trace:
+            print(f"Possible missed remember_fact trigger: {user_message}")
 
         self.store.log_message(session_id, "assistant", final_text)
         # Keep a lightweight semantic trace so search_memory has something to find later.
@@ -184,9 +259,44 @@ class Orchestrator:
                 "importance": _turn_importance(user_message, final_text, tool_call_trace),
             },
         )
-        if self._is_successful_multitool_turn(final_text, tool_call_trace):
+        if self._is_successful_multitool_turn(final_text, tool_call_trace, turn_state):
             self._record_procedure(user_message, tool_call_trace)
+        if self._is_successful_high_impact_turn(final_text, tool_call_trace, turn_state):
+            self._record_automatic_episode(tool_call_trace)
         return final_text
+
+    def _prerecall_facts(self, user_message: str) -> str:
+        """Inject only narrowly relevant durable facts before a model call."""
+        if not (_PRERECALL_RE.search(user_message) or user_message.rstrip().endswith("?") or _QUESTION_START_RE.search(user_message)):
+            return ""
+        try:
+            cfg = self._memory_retrieval
+            results = blended_search(
+                self.semantic_memory,
+                user_message,
+                3,
+                similarity_weight=float(cfg.get("similarity_weight", 0.6)),
+                recency_weight=float(cfg.get("recency_weight", 0.2)),
+                importance_weight=float(cfg.get("importance_weight", 0.2)),
+                half_life_days=float(cfg.get("half_life_days", 14)),
+            )
+            threshold = float(cfg.get("prerecall_min_score", 0.5))
+            relevant = [item for item in results if float(item.get("score", 0.0)) >= threshold]
+            if not relevant:
+                return ""
+            lines = [
+                "\n\nRelevant remembered facts (verify relevance before using):",
+            ]
+            for item in relevant:
+                metadata = item.get("metadata") or {}
+                category = metadata.get("category")
+                label = f" [{category}]" if category else ""
+                lines.append(f"- {item.get('text', '')}{label}")
+            return "\n".join(lines)
+        except Exception as exc:
+            # A local memory read must never prevent the requested model call.
+            print(f"[memory] Pre-response fact recall unavailable: {exc}")
+            return ""
 
     def get_last_model_used(self, session_id: str) -> str | None:
         return self._last_model_used.get(session_id)
@@ -203,6 +313,8 @@ class Orchestrator:
         force_chain_start_index: int | None = None,
         image_paths: list[str] | None = None,
         tool_call_trace: list[str] | None = None,
+        system_prompt: str = SYSTEM_PROMPT,
+        turn_state: dict[str, Any] | None = None,
     ) -> ChatResult:
         start = time.monotonic()
         executed_results: dict[tuple[str, Any], str] = {}
@@ -213,6 +325,8 @@ class Orchestrator:
         for _ in range(MAX_TOOL_ITERATIONS):
             elapsed = time.monotonic() - start
             if elapsed > loop_deadline - start:
+                if turn_state is not None:
+                    turn_state["hit_limit"] = True
                 return ChatResult(
                     text=self._stopped_tool_loop_response(messages, elapsed_seconds=elapsed),
                     model_used=last_model_used,
@@ -255,6 +369,15 @@ class Orchestrator:
                             "search_memory",
                         }
                     ]
+                # A single YouTube search is enough to answer an ordinary
+                # discovery request. Preventing near-identical follow-up
+                # searches stops weaker models from looping until the watchdog
+                # expires and dumping raw API dictionaries instead of replying.
+                if "youtube_search" in called_tool_names:
+                    selected_tools = [
+                        tool for tool in selected_tools
+                        if tool.get("name") != "youtube_search"
+                    ]
                 log_selection(relevance_context, tools, selected_tools)
             else:
                 selected_tools = tools
@@ -264,12 +387,14 @@ class Orchestrator:
                     tier,
                     messages,
                     tools=selected_tools,
-                    system=SYSTEM_PROMPT,
+                    system=system_prompt,
                     timeout_seconds=max(1, loop_deadline - start - elapsed),
                     force_chain_start_index=force_chain_start_index,
                 )
                 last_model_used = result.model_used
             except TimeoutError:
+                if turn_state is not None:
+                    turn_state["hit_limit"] = True
                 return ChatResult(
                     text=self._stopped_tool_loop_response(
                         messages,
@@ -326,6 +451,8 @@ class Orchestrator:
                                 "It may still be running in the background."
                             )
                         }
+                    if turn_state is not None and self._tool_result_has_error(output):
+                        turn_state["had_tool_error"] = True
                     output_str = str(output)
                     executed_results[cache_key] = output_str
                     if tool_call_trace is not None:
@@ -359,11 +486,28 @@ class Orchestrator:
 
             messages.append({"role": "user", "content": tool_result_blocks})
 
+        if turn_state is not None:
+            turn_state["hit_limit"] = True
         return ChatResult(text=self._stopped_tool_loop_response(messages), model_used=last_model_used)
 
     @staticmethod
-    def _is_successful_multitool_turn(final_text: str, tool_call_trace: list[str]) -> bool:
+    def _tool_result_has_error(output: Any) -> bool:
+        """Check the structured result, rather than trusting the model summary."""
+        if isinstance(output, dict):
+            return "error" in output
+        if isinstance(output, list):
+            return any(Orchestrator._tool_result_has_error(item) for item in output)
+        return False
+
+    @staticmethod
+    def _is_successful_multitool_turn(
+        final_text: str,
+        tool_call_trace: list[str],
+        turn_state: dict[str, Any] | None = None,
+    ) -> bool:
         """Only learn from completed, genuinely multi-tool turns."""
+        if turn_state and (turn_state.get("had_tool_error") or turn_state.get("hit_limit")):
+            return False
         reply = final_text.strip().lower()
         return (
             len(set(tool_call_trace)) >= 2
@@ -377,7 +521,7 @@ class Orchestrator:
         """Persist a successful tool sequence without another LLM request."""
         try:
             signature = user_message.strip()[:500]
-            if not signature:
+            if not self._is_useful_procedure_signature(signature):
                 return
             threshold = float(
                 getattr(self, "_procedure_config", {}).get("similarity_threshold", 0.85)
@@ -402,6 +546,46 @@ class Orchestrator:
         except Exception as exc:
             # Procedure learning must never change a successful user-facing reply.
             print(f"[memory] Could not record procedure: {exc}")
+
+    @staticmethod
+    def _is_useful_procedure_signature(signature: str) -> bool:
+        normalized = re.sub(r"\s+", " ", signature.strip().lower())
+        if not normalized or normalized in _VAGUE_PROCEDURE_SIGNATURES:
+            return False
+        return len(re.findall(r"\b[\w']+\b", normalized)) >= 4
+
+    @staticmethod
+    def _is_successful_high_impact_turn(
+        final_text: str,
+        tool_call_trace: list[str],
+        turn_state: dict[str, Any],
+    ) -> bool:
+        reply = final_text.strip().lower()
+        return (
+            len(set(tool_call_trace)) >= 3
+            and not turn_state.get("had_tool_error")
+            and not turn_state.get("hit_limit")
+            and bool(reply)
+            and "waiting for your approval" not in reply
+            and "task may be incomplete" not in reply
+        )
+
+    def _record_automatic_episode(self, tool_call_trace: list[str]) -> None:
+        """Record a high-impact completed turn without another model/API call."""
+        try:
+            tools = list(dict.fromkeys(tool_call_trace))
+            summary = "Completed multi-step task using: " + ", ".join(tools)
+            self.episodic_memory.add_memory(
+                summary,
+                {
+                    "outcome": "success",
+                    "importance": 4,
+                    "auto_logged": True,
+                },
+            )
+        except Exception as exc:
+            # Memory recording must never change a successful user-facing reply.
+            print(f"[memory] Could not record automatic episode: {exc}")
 
     def _slow_tool_timeout_seconds(self, tool_name: str) -> int | None:
         """Return only an explicitly configured slow-tool budget, if any."""

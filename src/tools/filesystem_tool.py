@@ -1,6 +1,7 @@
 """Read/write/list files in the workspace and configured user folders."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -43,7 +44,20 @@ class FilesystemTool(Tool):
     def _resolve(self, path_value: str) -> Path:
         supplied = Path(path_value).expanduser()
         candidate = (supplied if supplied.is_absolute() else self.root / supplied).resolve()
-        if not any(candidate == root or root in candidate.parents for root in self.allowed_roots):
+        # Path.parents comparisons are not reliably case-insensitive on Windows.
+        # Normalize both sides and use commonpath so configured user folders such
+        # as C:\\Users\\HP\\Downloads work consistently with absolute paths.
+        def is_within(candidate_path: Path, root_path: Path) -> bool:
+            try:
+                return os.path.commonpath(
+                    [os.path.normcase(os.path.abspath(str(candidate_path))),
+                     os.path.normcase(os.path.abspath(str(root_path)))]
+                ) == os.path.normcase(os.path.abspath(str(root_path)))
+            except ValueError:
+                # Different drives (or malformed paths) are never contained.
+                return False
+
+        if not any(is_within(candidate, root) for root in self.allowed_roots):
             roots = ", ".join(str(root) for root in self.allowed_roots)
             raise PermissionError(f"Path '{path_value}' is outside the configured filesystem roots ({roots}) — refused.")
         return candidate

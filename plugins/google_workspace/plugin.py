@@ -50,13 +50,19 @@ class GoogleWorkspaceConfig:
 
     @property
     def scopes(self) -> list[str]:
-        configured = self.data.get("scopes", ["gmail.readonly", "gmail.send", "calendar"])
+        configured = self.data.get(
+            "scopes", ["gmail.readonly", "gmail.send", "calendar", "youtube.readonly"]
+        )
         items = configured if isinstance(configured, list) else [configured]
         mapping = {
             "gmail.readonly": "https://www.googleapis.com/auth/gmail.readonly",
             "gmail.send": "https://www.googleapis.com/auth/gmail.send",
             "gmail.modify": "https://www.googleapis.com/auth/gmail.modify",
             "calendar": "https://www.googleapis.com/auth/calendar",
+            "youtube.readonly": "https://www.googleapis.com/auth/youtube.readonly",
+            "youtube": "https://www.googleapis.com/auth/youtube",
+            "youtube.force-ssl": "https://www.googleapis.com/auth/youtube.force-ssl",
+            "youtube.upload": "https://www.googleapis.com/auth/youtube.upload",
         }
         return [mapping.get(str(item), str(item)) for item in items]
 

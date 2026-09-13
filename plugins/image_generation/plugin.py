@@ -255,13 +255,13 @@ class GenerateImageTool(Tool):
                 if 200 <= history.status_code < 300:
                     image = _output_image(history.json(), prompt_id)
                     if image:
-                        return self._download_output(image, checkpoint)
+                        return self._download_output(image, checkpoint, prompt)
             except (requests.RequestException, ValueError) as exc:
                 return {"error": f"Could not read the local ComfyUI result: {exc}"}
             time.sleep(1)
         return {"error": f"Local ComfyUI did not finish within {timeout}s."}
 
-    def _download_output(self, image: dict[str, Any], checkpoint: str) -> dict[str, Any]:
+    def _download_output(self, image: dict[str, Any], checkpoint: str, prompt: str) -> dict[str, Any]:
         filename = str(image.get("filename", ""))
         if not filename:
             return {"error": "ComfyUI completed but returned an image without a filename."}
@@ -279,12 +279,23 @@ class GenerateImageTool(Tool):
         workspace = self._workspace_root()
         output_dir = workspace / "generated_images"
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.{_extension(mime_type)}"
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        prompt_slug = re.sub(r"[^A-Za-z0-9]+", "_", prompt).strip("_")[:72] or "generated_image"
+        output_path = output_dir / f"{timestamp}_{prompt_slug}.{_extension(mime_type)}"
         try:
             output_path.write_bytes(response.content)
         except OSError as exc:
             return {"error": f"Could not save generated image: {exc}"}
-        return {"path": output_path.relative_to(workspace).as_posix(), "mimeType": mime_type, "backend": "local_comfyui", "model": checkpoint}
+        return {
+            "path": output_path.relative_to(workspace).as_posix(),
+            "filename": output_path.name,
+            "mimeType": mime_type,
+            "size_bytes": len(response.content),
+            "prompt": prompt,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "backend": "local_comfyui",
+            "model": checkpoint,
+        }
 
     def _full_config(self) -> dict[str, Any]:
         path = self.root / "config.yaml"

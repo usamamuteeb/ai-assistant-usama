@@ -79,7 +79,7 @@ tool_relevance_filter:
   enabled: true
   # The mandatory core list includes WhatsApp Web so the chatbot can describe
   # and use it even when relevance filtering is enabled.
-  max_tools: 20
+  max_tools: 30
   min_tools: 6
   core_tools:
     - filesystem
@@ -93,6 +93,15 @@ tool_relevance_filter:
     - whatsapp_open
     - whatsapp_list_unread_chats
     - whatsapp_read_chat
+    # Keep the intent-critical YouTube actions available to the chatbot even
+    # when relevance filtering is enabled.
+    - youtube_play
+    - youtube_search
+    - youtube_channel_overview
+    - youtube_download_video
+    - youtube_download_audio
+    - youtube_download_status
+    - youtube_cancel_download
     - whatsapp_get_last_message_status
     - whatsapp_send_message
     - remember_fact
@@ -100,6 +109,8 @@ tool_relevance_filter:
     - log_episode
     - recall_episodes
     - recall_procedure
+    - list_memories
+    - remove_memory
     # Keep the screen-reader capability available for explicit screen-reading
     # requests; local keyword ranking alone can hide it behind the tool cap.
     - read_screen_text
@@ -122,8 +133,10 @@ memory_retrieval:
   recency_weight: 0.2
   importance_weight: 0.2
   half_life_days: 14
+  prerecall_min_score: 0.5
   procedural_memory:
     similarity_threshold: 0.85
+    fallback_similarity_threshold: 0.70
 
 filesystem_tool:
   workspace_root: workspace           # relative paths are resolved here
@@ -205,6 +218,15 @@ google_workspace:
     - gmail.send
     - gmail.modify
     - calendar
+    - youtube.readonly
+
+youtube:
+  # Uses the existing encrypted Google OAuth token cache. The first YouTube
+  # call may request consent for this additional read-only scope.
+  enabled: true
+  # Downloads go to the real Windows Downloads folder by default. It must be
+  # inside filesystem_tool.allowed_roots.
+  download_folder: 'C:\Users\HP\Downloads\Neural YouTube'
 
 knowledge_base:
   folder: knowledge_base               # relative to workspace root

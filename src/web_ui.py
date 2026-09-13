@@ -228,7 +228,7 @@ _approval_modes: dict[str, str] = {}
 _last_confirmation_results: dict[str, bool] = {}
 _activity_by_session: dict[str, list[dict[str, str]]] = {}
 _activity_lock = threading.Lock()
-_background_results: dict[str, dict[str, Any]] = {}
+_background_results: dict[tuple[str, str], dict[str, Any]] = {}
 _background_results_lock = threading.Lock()
 _kb_watch_notifications: list[str] = []
 _kb_watch_lock = threading.Lock()
@@ -677,6 +677,7 @@ def _store_background_result(
     session_id: str,
     task: asyncio.Task[str],
     *,
+    request_id: str,
     voice_request: bool = False,
 ) -> None:
     """Capture a late worker result without touching NiceGUI from a callback.
@@ -689,6 +690,7 @@ def _store_background_result(
     try:
         reply = task.result()
         payload = {
+            "request_id": request_id,
             "reply": reply,
             "model_used": orchestrator.get_last_model_used(session_id),
             "images": orchestrator.get_last_images(session_id),
@@ -698,6 +700,7 @@ def _store_background_result(
     except Exception as exc:
         traceback.print_exc()
         payload = {
+            "request_id": request_id,
             "reply": f"[error] {exc}",
             "model_used": orchestrator.get_last_model_used(session_id),
             "images": [],
@@ -705,12 +708,13 @@ def _store_background_result(
             "voice_request": voice_request,
         }
     with _background_results_lock:
-        _background_results[session_id] = payload
+        _background_results[(session_id, request_id)] = payload
 
 
 def _take_background_result(session_id: str) -> dict[str, Any] | None:
     with _background_results_lock:
-        return _background_results.pop(session_id, None)
+        key = next((key for key in _background_results if key[0] == session_id), None)
+        return _background_results.pop(key) if key is not None else None
 
 
 def _available_port(start: int = 8080) -> int:
@@ -842,6 +846,13 @@ def main() -> None:
         .q-drawer { background: linear-gradient(180deg, #1f2023 0%, #18191c 100%); box-shadow: 16px 0 40px rgba(0,0,0,.26); }
         .assistant-sidebar { border-right: 1px solid rgba(209,32,44,.30); }
         .assistant-activity-drawer { border-left: 1px solid rgba(209,32,44,.30); box-shadow: -16px 0 40px rgba(0,0,0,.26); }
+        .assistant-activity-drawer, .assistant-activity-drawer .q-drawer__content, .assistant-activity-drawer .scroll {
+            scrollbar-width: none;
+            -ms-overflow-style: none;
+        }
+        .assistant-activity-drawer::-webkit-scrollbar,
+        .assistant-activity-drawer .q-drawer__content::-webkit-scrollbar,
+        .assistant-activity-drawer .scroll::-webkit-scrollbar { width: 0; height: 0; display: none; }
         .assistant-sidebar { height: 100%; }
         .sidebar-content { width: 100%; height: 100%; gap: 1rem; }
         .sidebar-card { width: 100%; padding: 1rem; border: 1px solid rgba(255,255,255,.075); border-radius: 8px; background: rgba(255,255,255,.025); box-shadow: 0 8px 22px rgba(0,0,0,.08); }
@@ -958,7 +969,8 @@ def main() -> None:
         .image-setup-meta { color: #777f8b; font-size: .62rem; }
         .image-setup-log { width: 100%; max-height: 7.4rem; overflow-y: auto; margin: .1rem 0 0; padding: .48rem; border-radius: 7px; background: rgba(0,0,0,.24); color: #b8c0cb; font-family: Consolas, monospace; font-size: .59rem; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
         .image-setup-retry { width: 100%; margin-top: .1rem; color: #fff; background: rgba(209,32,44,.82); font-size: .67rem; }
-        .activity-feed { width: 100%; gap: .65rem; padding: 1rem 0; overflow-y: auto; }
+        .activity-feed { width: 100%; gap: .65rem; padding: 1rem 0; overflow-y: auto; scrollbar-width: none; -ms-overflow-style: none; }
+        .activity-feed::-webkit-scrollbar { width: 0; height: 0; }
         .activity-empty { padding: 1rem .2rem; color: var(--muted); font-size: .78rem; line-height: 1.5; }
         .activity-event { width: 100%; gap: .65rem; padding: .7rem; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.025); }
         .activity-event-icon { margin-top: .05rem; font-size: 1rem; }
@@ -1820,6 +1832,10 @@ def main() -> None:
             else:
                 ui.notify("The previous request is still running. Please wait before sending another message.", type="warning")
             return
+        request_id = uuid.uuid4().hex
+        background_request_ids = client.setdefault("background_request_ids", [])
+        if request_id not in background_request_ids:
+            background_request_ids.append(request_id)
         sending[request_channel] = True
         message_input.value = ""
         history = client["chat_history"]
@@ -1868,6 +1884,7 @@ def main() -> None:
                     "role": "assistant",
                     "content": "⏳ This request is still running. The completed reply and any generated image will replace this message automatically.",
                     "pending": True,
+                    "request_id": request_id,
                     "model_used": None,
                     "images": [],
                 }
@@ -1886,6 +1903,7 @@ def main() -> None:
                     lambda completed_task: _store_background_result(
                         session_id,
                         completed_task,
+                        request_id=request_id,
                         voice_request=voice_request,
                     )
                 )
@@ -1896,6 +1914,8 @@ def main() -> None:
                 and reply.startswith("Waiting for your approval on:")
             ):
                 reply = "Command denied by user."
+            if request_id in background_request_ids:
+                background_request_ids.remove(request_id)
         except Exception as exc:
             traceback.print_exc()
             if voice_request:
@@ -1903,6 +1923,8 @@ def main() -> None:
             else:
                 _record_activity(session_id, "error", "Request failed", str(exc))
             reply = f"[error] {exc}"
+        if request_id in background_request_ids:
+            background_request_ids.remove(request_id)
         model_used = orchestrator.get_last_model_used(session_id)
         voice_failed = reply.startswith("[error]") or "task may be incomplete" in reply.casefold()
         if voice_request:
@@ -1975,10 +1997,26 @@ def main() -> None:
             return
 
         history = client["chat_history"]
+        request_id = str(background_result.get("request_id", ""))
         pending_entry = next(
-            (entry for entry in reversed(history) if entry.get("role") == "assistant" and entry.get("pending")),
+            (
+                entry
+                for entry in reversed(history)
+                if entry.get("role") == "assistant"
+                and entry.get("pending")
+                and str(entry.get("request_id", "")) == request_id
+            ),
             None,
         )
+        known_request_ids = client.setdefault("background_request_ids", [])
+        if pending_entry is None and request_id not in known_request_ids:
+            # A late result from another request must never be attached to the
+            # current chat turn (this previously caused an unrelated old image
+            # to appear beside a later YouTube/memory answer).
+            logger.warning("Discarding late background result for unknown request %s", request_id or "<missing>")
+            return
+        if request_id in known_request_ids:
+            known_request_ids.remove(request_id)
         completed_reply = str(background_result["reply"])
         completed_model = background_result.get("model_used")
         if pending_entry is None:
@@ -1989,6 +2027,7 @@ def main() -> None:
                     "role": "assistant",
                     "content": completed_reply,
                     "pending": False,
+                    "request_id": request_id,
                     "model_used": completed_model,
                     "images": list(background_result.get("images", [])),
                 }
@@ -2028,11 +2067,16 @@ def main() -> None:
                     f"Completed via {completed_model}." if completed_model else "Completed successfully.",
                 )
                 if background_result.get("images"):
+                    image_names = ", ".join(
+                        Path(str(path)).name for path in background_result["images"][:4]
+                    )
+                    if len(background_result["images"]) > 4:
+                        image_names += ", …"
                     _record_activity(
                         session_id,
                         "done",
                         "Generated image ready",
-                        f"{len(background_result['images'])} image file(s) are available in the chat.",
+                        f"{len(background_result['images'])} image file(s) are available in the chat: {image_names}",
                     )
         _render_history(chat_log, history)
         # The completed background turn may have created a reminder; update

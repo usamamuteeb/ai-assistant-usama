@@ -784,8 +784,10 @@ class BrowserScreenshotTool(Tool):
             screenshots_dir.mkdir(parents=True, exist_ok=True)
 
             def action(page: Any) -> Any:
+                title = page.title().strip() or "page"
+                safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._")[:80] or "page"
                 timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-                screenshot_path = screenshots_dir / f"browser_{timestamp}.png"
+                screenshot_path = screenshots_dir / f"browser_{timestamp}_{safe_title}.png"
                 page.screenshot(path=str(screenshot_path), full_page=True)
                 relative_path = screenshot_path.relative_to(self.config.root)
                 screenshot_url = f"/screenshots/{screenshot_path.name}"
@@ -793,6 +795,9 @@ class BrowserScreenshotTool(Tool):
                     "path": str(relative_path).replace("\\", "/"),
                     "url": screenshot_url,
                     "markdown": f"![Browser screenshot]({screenshot_url})",
+                    "filename": screenshot_path.name,
+                    "page_title": title,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
                     "tab_id": self.session.active_tab_id(),
                 }
 

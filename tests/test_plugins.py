@@ -20,6 +20,7 @@ PLUGIN_NAMES = [
     "screen_reader",
     "whatsapp",
     "windows_control",
+    "youtube",
 ]
 
 

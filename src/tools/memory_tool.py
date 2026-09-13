@@ -1,6 +1,8 @@
 """Core local tools for conversation, semantic, episodic, and procedural memory."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import re
 from typing import Any
 
 from ..memory.store import SqliteStore
@@ -184,6 +186,15 @@ class RecallProcedureTool(Tool):
         self.store = store
         self.retrieval_config = retrieval_config or {}
         self.similarity_threshold = float(similarity_threshold)
+        procedural_config = self.retrieval_config.get("procedural_memory", {})
+        if not isinstance(procedural_config, dict):
+            procedural_config = {}
+        try:
+            self.fallback_similarity_threshold = float(
+                procedural_config.get("fallback_similarity_threshold", 0.70)
+            )
+        except (TypeError, ValueError):
+            self.fallback_similarity_threshold = 0.70
 
     def run(self, task_description: str) -> Any:
         text = str(task_description or "").strip()
@@ -191,13 +202,149 @@ class RecallProcedureTool(Tool):
             return {"error": "task_description cannot be empty."}
         try:
             candidates = _search(self.procedure_signatures, text, 5, self.retrieval_config)
-            matches = [item for item in candidates if float(item.get("raw_similarity", 0.0)) >= self.similarity_threshold and (item.get("metadata") or {}).get("procedure_id") is not None]
+            candidates = [
+                item for item in candidates
+                if (item.get("metadata") or {}).get("procedure_id") is not None
+            ]
+            matches = [
+                item for item in candidates
+                if float(item.get("raw_similarity", 0.0)) >= self.similarity_threshold
+            ]
+            confidence = "high"
+            if not matches:
+                matches = [
+                    item for item in candidates
+                    if float(item.get("raw_similarity", 0.0)) >= self.fallback_similarity_threshold
+                ]
+                confidence = "low"
             if not matches:
                 return {"found": False}
             best = max(matches, key=lambda item: float(item.get("raw_similarity", 0.0)))
             procedure = self.store.get_procedure(int(best["metadata"]["procedure_id"]))
             if procedure is None:
                 return {"found": False}
-            return {"found": True, "task_signature": procedure["task_signature"], "steps": procedure["steps"], "success_count": procedure["success_count"], "similarity": best["raw_similarity"]}
+            return {"found": True, "confidence": confidence, "task_signature": procedure["task_signature"], "steps": procedure["steps"], "success_count": procedure["success_count"], "similarity": best["raw_similarity"]}
         except Exception as exc:
             return {"error": f"Could not recall procedure: {exc}"}
+
+
+def _iso_timestamp(value: Any) -> str | None:
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _content_preview(value: Any, limit: int = 240) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "..."
+
+
+class ListMemoriesTool(Tool):
+    name = "list_memories"
+    description = "List recent entries from semantic, episodic, or procedural memory for inspection and management."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "layer": {"type": "string", "enum": ["semantic", "episodic", "procedural"]},
+            "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+        },
+        "required": ["layer"],
+    }
+
+    def __init__(self, semantic_memory: VectorMemory, episodic_memory: VectorMemory, procedure_signatures: VectorMemory, store: SqliteStore):
+        self.semantic_memory = semantic_memory
+        self.episodic_memory = episodic_memory
+        self.procedure_signatures = procedure_signatures
+        self.store = store
+
+    def run(self, layer: str, limit: int = 20) -> Any:
+        layer = str(layer or "").strip().lower()
+        if layer not in {"semantic", "episodic", "procedural"}:
+            return {"error": "layer must be semantic, episodic, or procedural."}
+        try:
+            limit = min(max(1, int(limit)), 100)
+            if layer == "procedural":
+                with self.store._lock:
+                    rows = self.store.conn.execute(
+                        "SELECT id, task_signature, success_count, created_at "
+                        "FROM procedures ORDER BY created_at DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                entries = [
+                    {
+                        "id": int(row["id"]),
+                        "content_preview": _content_preview(row["task_signature"]),
+                        "timestamp": _iso_timestamp(row["created_at"]),
+                        "success_count": int(row["success_count"] or 0),
+                    }
+                    for row in rows
+                ]
+            else:
+                memory = self.semantic_memory if layer == "semantic" else self.episodic_memory
+                entries = []
+                for item in memory.list_entries(limit):
+                    metadata = item.get("metadata") or {}
+                    entry = {
+                        "id": item["id"],
+                        "content_preview": _content_preview(item.get("text")),
+                        "timestamp": _iso_timestamp(metadata.get("created_at")),
+                    }
+                    if layer == "semantic":
+                        entry["category"] = metadata.get("category")
+                    else:
+                        entry["outcome"] = metadata.get("outcome")
+                        entry["importance"] = metadata.get("importance", 0.5)
+                    entries.append(entry)
+            return {"layer": layer, "entries": entries, "count": len(entries)}
+        except Exception as exc:
+            return {"error": f"Could not list {layer} memories: {exc}"}
+
+
+class RemoveMemoryTool(Tool):
+    name = "remove_memory"
+    description = "Remove one specific semantic, episodic, or procedural memory entry by the stable id returned by list_memories."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "layer": {"type": "string", "enum": ["semantic", "episodic", "procedural"]},
+            "id": {"type": "string", "description": "Stable id returned by list_memories."},
+        },
+        "required": ["layer", "id"],
+    }
+
+    def __init__(self, semantic_memory: VectorMemory, episodic_memory: VectorMemory, procedure_signatures: VectorMemory, store: SqliteStore):
+        self.semantic_memory = semantic_memory
+        self.episodic_memory = episodic_memory
+        self.procedure_signatures = procedure_signatures
+        self.store = store
+
+    def run(self, layer: str, id: str) -> Any:
+        layer = str(layer or "").strip().lower()
+        identifier = str(id or "").strip()
+        if layer not in {"semantic", "episodic", "procedural"}:
+            return {"error": "layer must be semantic, episodic, or procedural."}
+        if not identifier:
+            return {"error": "id cannot be empty."}
+        try:
+            if layer in {"semantic", "episodic"}:
+                memory = self.semantic_memory if layer == "semantic" else self.episodic_memory
+                removed = memory.delete_memory(identifier)
+                return {"layer": layer, "id": identifier, "removed": removed}
+
+            try:
+                procedure_id = int(identifier)
+            except (TypeError, ValueError):
+                return {"error": "procedural memory id must be an integer."}
+            with self.store._lock:
+                row = self.store.conn.execute(
+                    "SELECT id FROM procedures WHERE id = ?", (procedure_id,)
+                ).fetchone()
+                if row is None:
+                    return {"layer": layer, "id": procedure_id, "removed": False}
+                self.store.conn.execute("DELETE FROM procedures WHERE id = ?", (procedure_id,))
+                self.store.conn.commit()
+            vector_count = self.procedure_signatures.delete_where({"procedure_id": procedure_id})
+            return {"layer": layer, "id": procedure_id, "removed": True, "signature_entries_removed": vector_count}
+        except Exception as exc:
+            return {"error": f"Could not remove {layer} memory: {exc}"}
