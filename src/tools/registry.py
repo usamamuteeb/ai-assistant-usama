@@ -62,7 +62,11 @@ def build_registry(settings, vector_store, confirm_fn=None) -> ToolRegistry:
     from ..config import Settings  # noqa: F401  (type hint only, avoids circular import at module load)
 
     built_in: list[Tool] = [
-        FilesystemTool(workspace_root=settings.workspace_root()),
+        FilesystemTool(
+            workspace_root=settings.workspace_root(),
+            allowed_roots=settings.filesystem_tool.get("allowed_roots", []),
+            confirm_fn=confirm_fn,
+        ),
         ShellTool(
             timeout_seconds=settings.shell_tool.get("timeout_seconds", 30),
             require_confirmation=settings.shell_tool.get("require_confirmation", True),

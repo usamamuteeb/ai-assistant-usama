@@ -23,6 +23,7 @@ class Settings:
     ollama_host_env: str | None = None
     groq_api_key: str | None = None
     gemini_api_key: str | None = None
+    openrouter_api_key: str | None = None
 
     def __post_init__(self) -> None:
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY") or None
@@ -30,6 +31,7 @@ class Settings:
         self.ollama_host_env = os.getenv("OLLAMA_HOST") or None
         self.groq_api_key = os.getenv("GROQ_API_KEY") or None
         self.gemini_api_key = os.getenv("GEMINI_API_KEY") or None
+        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY") or None
 
     # --- convenience accessors over the yaml tree ---
     @property

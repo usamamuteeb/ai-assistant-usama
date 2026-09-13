@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import platform
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -20,6 +21,7 @@ if _WINDOWS:
         import psutil
         import pyautogui
         from pywinauto import Application, Desktop
+        from pywinauto.controls.hwndwrapper import HwndWrapper
 
         # This is intentionally enabled: moving the pointer to a screen corner
         # aborts pyautogui's fallback action.
@@ -51,6 +53,8 @@ def _visible_windows() -> list[Any]:
 
 def _find_window(title: str) -> Any | None:
     wanted = title.strip().casefold()
+    if not wanted:
+        return None
     windows = _visible_windows()
     for window in windows:
         try:
@@ -72,6 +76,43 @@ def _process_name(pid: int) -> str:
         return psutil.Process(pid).name()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return "unknown"
+
+
+def _window_controls(window: Any) -> list[dict[str, str]]:
+    """Return visible, user-facing controls from a pywinauto element tree."""
+    controls: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for control in window.descendants():
+        try:
+            if not control.is_visible():
+                continue
+            control_type = str(getattr(control.element_info, "control_type", "Unknown"))
+            text = control.window_text().strip()
+            if not text or control_type not in {
+                "Text", "Button", "Edit", "ComboBox", "CheckBox", "RadioButton", "ListItem"
+            }:
+                continue
+            key = (control_type, text)
+            if key not in seen:
+                seen.add(key)
+                controls.append({"control_type": control_type, "text": text})
+        except Exception:
+            continue
+    return controls
+
+
+def _active_window() -> Any | None:
+    """Find the visible pywinauto top-level wrapper for the foreground HWND."""
+    foreground = int(ctypes.windll.user32.GetForegroundWindow())
+    if not foreground:
+        return None
+    for window in _visible_windows():
+        try:
+            if int(window.handle) == foreground:
+                return window
+        except Exception:
+            continue
+    return None
 
 
 class ListOpenWindowsTool(Tool):
@@ -113,25 +154,7 @@ class ReadWindowTextTool(Tool):
             if window is None:
                 return {"error": f"No window matching '{title}' found."}
 
-            controls: list[dict[str, str]] = []
-            seen: set[tuple[str, str]] = set()
-            for control in window.descendants():
-                try:
-                    if not control.is_visible():
-                        continue
-                    control_type = str(getattr(control.element_info, "control_type", "Unknown"))
-                    text = control.window_text().strip()
-                    if not text or control_type not in {
-                        "Text", "Button", "Edit", "ComboBox", "CheckBox", "RadioButton", "ListItem"
-                    }:
-                        continue
-                    key = (control_type, text)
-                    if key not in seen:
-                        seen.add(key)
-                        controls.append({"control_type": control_type, "text": text})
-                except Exception:
-                    continue
-            return {"title": window.window_text().strip(), "controls": controls}
+            return {"title": window.window_text().strip(), "controls": _window_controls(window)}
         except Exception as exc:
             return {"error": f"Could not read window text: {exc}"}
 
@@ -209,6 +232,241 @@ class ClickWindowControlTool(_ConfirmedWindowsTool):
             }
         except Exception as exc:
             return {"error": f"Could not click window control: {exc}"}
+
+
+class FocusWindowTool(_ConfirmedWindowsTool):
+    name = "focus_window"
+    description = "Bring a visible Windows desktop window matched by exact or partial title to the foreground, following the global approval mode."
+    input_schema = {
+        "type": "object",
+        "properties": {"title": {"type": "string", "description": "Exact or partial window title."}},
+        "required": ["title"],
+    }
+
+    def run(self, title: str) -> Any:
+        try:
+            window = _find_window(title)
+            if window is None:
+                return {"error": f"No window matching '{title}' found."}
+            if not self._confirmed(f"Focus window '{window.window_text().strip()}'?"):
+                return _DENIED
+            window.set_focus()
+            return {"status": "focused", "title": window.window_text().strip(), "handle": int(window.handle)}
+        except Exception as exc:
+            return {"error": f"Could not focus window '{title}': {exc}"}
+
+
+class MoveWindowTool(_ConfirmedWindowsTool):
+    name = "move_window"
+    description = "Reposition and/or resize a Windows desktop window. Omitted geometry values keep their current values; follows the global approval mode."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Exact or partial window title."},
+            "x": {"type": "integer", "description": "Optional left coordinate."},
+            "y": {"type": "integer", "description": "Optional top coordinate."},
+            "width": {"type": "integer", "description": "Optional width."},
+            "height": {"type": "integer", "description": "Optional height."},
+        },
+        "required": ["title"],
+    }
+
+    def run(
+        self,
+        title: str,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+    ) -> Any:
+        try:
+            window = _find_window(title)
+            if window is None:
+                return {"error": f"No window matching '{title}' found."}
+            rect = window.rectangle()
+            new_x = int(rect.left if x is None else x)
+            new_y = int(rect.top if y is None else y)
+            new_width = int(rect.width() if width is None else width)
+            new_height = int(rect.height() if height is None else height)
+            if new_width <= 0 or new_height <= 0:
+                return {"error": "Window width and height must be positive."}
+            if not self._confirmed(
+                f"Move/resize window '{window.window_text().strip()}' to "
+                f"({new_x}, {new_y}, {new_width}x{new_height})?"
+            ):
+                return _DENIED
+            # UIAWrapper exposes reliable geometry reads but pywinauto's
+            # move_window implementation is provided by its Win32 wrapper.
+            # Re-wrap the same verified HWND instead of using coordinates or
+            # looking up an unrelated window.
+            HwndWrapper(int(window.handle)).move_window(
+                x=new_x, y=new_y, width=new_width, height=new_height
+            )
+            return {
+                "status": "moved",
+                "title": window.window_text().strip(),
+                "old_rect": {"x": int(rect.left), "y": int(rect.top), "width": int(rect.width()), "height": int(rect.height())},
+                "new_rect": {"x": new_x, "y": new_y, "width": new_width, "height": new_height},
+            }
+        except Exception as exc:
+            return {"error": f"Could not move window '{title}': {exc}"}
+
+
+class LaunchAndWaitTool(_ConfirmedWindowsTool):
+    name = "launch_and_wait"
+    description = "Launch a Windows application and wait for a visible window matching its expected title or process name, following the global approval mode."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "application": {"type": "string", "description": "Executable name or program path."},
+            "expected_title": {"type": "string", "description": "Optional exact or partial expected window title."},
+            "expected_process": {"type": "string", "description": "Optional expected process name, with or without .exe."},
+            "timeout": {"type": "number", "description": "Wait time in seconds, default 15, capped at 30."},
+        },
+        "required": ["application"],
+    }
+
+    def run(
+        self,
+        application: str,
+        expected_title: str = "",
+        expected_process: str = "",
+        timeout: float = 15,
+    ) -> Any:
+        effective_timeout = max(0.0, min(float(timeout), 30.0))
+        process_hint = expected_process.strip().casefold()
+        if process_hint and not process_hint.endswith(".exe"):
+            process_hint += ".exe"
+        if not expected_title.strip() and not process_hint:
+            process_hint = Path(application.strip().strip('"')).name.casefold()
+        if not self._confirmed(f"Launch '{application}' and wait for its window?"):
+            return _DENIED
+        try:
+            Application(backend="uia").start(application)
+            deadline = time.monotonic() + effective_timeout
+            while True:
+                for window in _visible_windows():
+                    try:
+                        title = window.window_text().strip()
+                        title_matches = bool(expected_title.strip()) and expected_title.strip().casefold() in title.casefold()
+                        process_matches = bool(process_hint) and _process_name(int(window.process_id())).casefold() == process_hint
+                        if title_matches or process_matches:
+                            return {
+                                "status": "ready",
+                                "application": application,
+                                "title": title,
+                                "handle": int(window.handle),
+                                "pid": int(window.process_id()),
+                                "process_name": _process_name(int(window.process_id())),
+                            }
+                    except Exception:
+                        continue
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.25)
+            return {
+                "error": f"Launched '{application}' but no matching window appeared within {effective_timeout:g}s — it may still be starting, or the window title doesn't match what was expected."
+            }
+        except Exception as exc:
+            return {"error": f"Could not launch application '{application}': {exc}"}
+
+
+class ClickControlByIdTool(_ConfirmedWindowsTool):
+    name = "click_control_by_id"
+    description = "Click a Windows control by its pywinauto automation ID within a window matched by exact or partial title, following the global approval mode."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "window_title": {"type": "string", "description": "Exact or partial window title."},
+            "automation_id": {"type": "string", "description": "The UI Automation automation_id of the target control."},
+        },
+        "required": ["window_title", "automation_id"],
+    }
+
+    def run(self, window_title: str, automation_id: str) -> Any:
+        try:
+            window = _find_window(window_title)
+            if window is None:
+                return {"error": f"No window matching '{window_title}' found."}
+            target = next(
+                (control for control in window.descendants()
+                 if str(getattr(control.element_info, "automation_id", "")) == automation_id),
+                None,
+            )
+            if target is None:
+                return {"error": f"No control with automation_id '{automation_id}' found in '{window.window_text().strip()}'."}
+            if not self._confirmed(f"Click automation ID '{automation_id}' in window '{window.window_text().strip()}'?"):
+                return _DENIED
+            target.click_input()
+            return {"status": "clicked", "window_title": window.window_text().strip(), "automation_id": automation_id}
+        except Exception as exc:
+            return {"error": f"Could not click control by automation ID '{automation_id}': {exc}"}
+
+
+class TypeIntoWindowTool(_ConfirmedWindowsTool):
+    name = "type_into_window"
+    description = "Focus a specifically verified Windows window by title and type into that window with pywinauto; it never types into an arbitrary currently focused app."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Exact or partial title of the target window."},
+            "text": {"type": "string", "description": "Text to type into the verified target window."},
+        },
+        "required": ["title", "text"],
+    }
+
+    def run(self, title: str, text: str) -> Any:
+        try:
+            window = _find_window(title)
+            if window is None:
+                return {"error": f"No window matching '{title}' found; text was not sent."}
+            # Standard confirmation is deliberate: the title is verified and pywinauto
+            # sends to that window, unlike the blind-focus fallback tool.
+            if not self._confirmed(f"Type text into verified window '{window.window_text().strip()}'?"):
+                return _DENIED
+            # Prefer the document/edit element so modern apps such as Notepad
+            # receive text in their editor, while the top-level title remains
+            # the verified safety boundary.
+            editable = next(
+                (
+                    control
+                    for control in window.descendants()
+                    if str(getattr(control.element_info, "control_type", "")) in {"Edit", "Document"}
+                    and control.is_visible()
+                ),
+                None,
+            )
+            target = editable or window
+            target.set_focus()
+            # A small inter-key pause matters for UIA-backed editors (notably
+            # current Notepad); without it, slow native controls can collapse
+            # or repeat characters even though focus was correct.
+            target.type_keys(text, with_spaces=True, pause=0.05)
+            return {"status": "typed", "title": window.window_text().strip(), "characters": len(text)}
+        except Exception as exc:
+            return {"error": f"Could not type into verified window '{title}': {exc}"}
+
+
+class ReadActiveWindowTool(Tool):
+    name = "read_active_window"
+    description = "Read the foreground Windows desktop window's title, process details, and visible control text."
+    input_schema = {"type": "object", "properties": {}, "required": []}
+
+    def run(self) -> Any:
+        try:
+            window = _active_window()
+            if window is None:
+                return {"error": "No visible active Windows desktop window was found."}
+            pid = int(window.process_id())
+            return {
+                "title": window.window_text().strip(),
+                "process_name": _process_name(pid),
+                "pid": pid,
+                "handle": int(window.handle),
+                "controls": _window_controls(window),
+            }
+        except Exception as exc:
+            return {"error": f"Could not read the active window: {exc}"}
 
 
 class CloseWindowTool(_ConfirmedWindowsTool):
@@ -296,6 +554,12 @@ def register(confirm_fn: Optional[ConfirmFn] = None) -> list[Tool]:
         ReadWindowTextTool(),
         OpenApplicationTool(confirm_fn=normal_confirm),
         ClickWindowControlTool(confirm_fn=normal_confirm),
+        FocusWindowTool(confirm_fn=normal_confirm),
+        MoveWindowTool(confirm_fn=normal_confirm),
+        LaunchAndWaitTool(confirm_fn=normal_confirm),
+        ClickControlByIdTool(confirm_fn=normal_confirm),
+        TypeIntoWindowTool(confirm_fn=normal_confirm),
+        ReadActiveWindowTool(),
         CloseWindowTool(confirm_fn=risky_confirm),
         SendKeystrokesFallbackTool(confirm_fn=risky_confirm),
     ]

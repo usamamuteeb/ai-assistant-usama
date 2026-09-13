@@ -28,6 +28,12 @@ if str(ROOT) not in sys.path:
 
 from nicegui import app, run, ui
 
+try:
+    from watchdog.events import FileSystemEventHandler
+except ImportError:  # optional until requirements are installed
+    class FileSystemEventHandler:  # type: ignore[no-redef]
+        pass
+
 from src.config import load_settings
 from src.orchestrator import Orchestrator
 from src.voice import speak_text, transcribe_audio
@@ -78,6 +84,10 @@ _activity_by_session: dict[str, list[dict[str, str]]] = {}
 _activity_lock = threading.Lock()
 _background_results: dict[str, dict[str, Any]] = {}
 _background_results_lock = threading.Lock()
+_kb_watch_notifications: list[str] = []
+_kb_watch_lock = threading.Lock()
+_kb_watch_timers: dict[str, threading.Timer] = {}
+_kb_watch_observer: Any | None = None
 _active_session_id: str | None = None
 _active_request_task: asyncio.Task[str] | None = None
 
@@ -286,6 +296,101 @@ def _tracked_tool_call(name: str, **kwargs: Any) -> Any:
 
 
 orchestrator.tools.call = _tracked_tool_call
+
+
+def _knowledge_watch_summary(result: Any) -> str:
+    if not isinstance(result, dict):
+        return f"Knowledge-base auto-index failed: {result}"
+    if result.get("error"):
+        return f"Knowledge-base auto-index failed: {result['error']}"
+    ingested = len(result.get("ingested_files", []))
+    skipped = len(result.get("skipped_unchanged", []))
+    duplicates = len(result.get("duplicates", []))
+    failed = len(result.get("failed_files", []))
+    chunks = result.get("total_chunks_added", 0)
+    suffix = f"; {duplicates} duplicate(s)" if duplicates else ""
+    suffix += f"; {failed} failed" if failed else ""
+    return f"Knowledge base updated: {ingested} new file(s), {chunks} chunks, {skipped} unchanged skipped{suffix}."
+
+
+def _run_knowledge_watch_ingest(path_text: str) -> None:
+    try:
+        result = orchestrator.tools.call("ingest_knowledge_base")
+        message = _knowledge_watch_summary(result)
+    except Exception as exc:
+        logger.warning("Knowledge-base watcher ingestion failed for %s: %s", path_text, exc)
+        message = f"Knowledge-base auto-index failed for {Path(path_text).name}: {exc}"
+    with _kb_watch_lock:
+        _kb_watch_notifications.append(message)
+        del _kb_watch_notifications[:-20]
+
+
+class _KnowledgeBaseWatchHandler(FileSystemEventHandler):
+    """Debounced watcher; intentionally only created by the web UI process."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def on_created(self, event: Any) -> None:
+        self._schedule(event)
+
+    def on_modified(self, event: Any) -> None:
+        self._schedule(event)
+
+    def _schedule(self, event: Any) -> None:
+        if getattr(event, "is_directory", False):
+            return
+        path = Path(str(getattr(event, "src_path", "")))
+        if path.suffix.lower() not in {".pdf", ".txt", ".md", ".docx", ".xlsx", ".pptx"}:
+            return
+        key = str(path.resolve())
+        with _kb_watch_lock:
+            old_timer = _kb_watch_timers.pop(key, None)
+            if old_timer is not None:
+                old_timer.cancel()
+            timer = threading.Timer(3.0, _run_knowledge_watch_ingest, args=(key,))
+            timer.daemon = True
+            _kb_watch_timers[key] = timer
+            timer.start()
+
+
+def _start_knowledge_base_watcher() -> None:
+    """Start folder watching for the web UI only; CLI and scheduler stay manual."""
+    global _kb_watch_observer
+    try:
+        from watchdog.observers import Observer
+    except ImportError:
+        logger.warning("Knowledge-base auto-watching is unavailable: install watchdog.")
+        return
+    ingest_tool = getattr(orchestrator.tools, "_tools", {}).get("ingest_knowledge_base")
+    watch_dir = getattr(ingest_tool, "knowledge_base_dir", _ui_settings.workspace_root() / "knowledge_base")
+    try:
+        watch_dir.mkdir(parents=True, exist_ok=True)
+        observer = Observer()
+        observer.schedule(_KnowledgeBaseWatchHandler(), str(watch_dir), recursive=False)
+        observer.start()
+        _kb_watch_observer = observer
+        logger.info("Knowledge-base watcher started for %s (web UI only).", watch_dir)
+    except Exception as exc:
+        logger.warning("Could not start knowledge-base watcher: %s", exc)
+        return
+
+    shutdown_hook = getattr(app, "on_shutdown", None)
+    if callable(shutdown_hook):
+        async def stop_knowledge_base_watcher() -> None:
+            global _kb_watch_observer
+            if _kb_watch_observer is not None:
+                _kb_watch_observer.stop()
+                _kb_watch_observer.join(timeout=5)
+                _kb_watch_observer = None
+
+        try:
+            shutdown_hook(stop_knowledge_base_watcher)
+        except Exception as exc:
+            logger.warning("Could not register knowledge-base watcher shutdown hook: %s", exc)
+
+
+_start_knowledge_base_watcher()
 
 
 def _selection_args(selection: str) -> tuple[str | None, int | None]:
@@ -653,7 +758,8 @@ def main() -> None:
         }
     """)
 
-    knowledge_base_dir = _ui_settings.workspace_root() / "knowledge_base"
+    ingest_tool = getattr(orchestrator.tools, "_tools", {}).get("ingest_knowledge_base")
+    knowledge_base_dir = getattr(ingest_tool, "knowledge_base_dir", _ui_settings.workspace_root() / "knowledge_base")
     knowledge_base_dir.mkdir(parents=True, exist_ok=True)
 
     def indexed_knowledge_files() -> list[str]:
@@ -666,8 +772,8 @@ def main() -> None:
         original_name = str(getattr(event.file, "name", "document"))
         filename = Path(original_name).name
         try:
-            if Path(filename).suffix.lower() not in {".pdf", ".txt", ".md"}:
-                ui.notify("Only PDF, TXT, and Markdown files are supported.", type="negative")
+            if Path(filename).suffix.lower() not in {".pdf", ".txt", ".md", ".docx", ".xlsx", ".pptx"}:
+                ui.notify("Only PDF, TXT, Markdown, DOCX, XLSX, and PPTX files are supported.", type="negative")
                 return
             await event.file.save(str(knowledge_base_dir / filename))
             ui.notify(
@@ -700,8 +806,12 @@ def main() -> None:
                 ingested = len(result.get("ingested_files", []))
                 chunks = result.get("total_chunks_added", 0)
                 skipped = len(result.get("skipped_unchanged", []))
+                duplicates = len(result.get("duplicates", []))
+                failed = len(result.get("failed_files", []))
+                extra = f", {duplicates} duplicate(s)" if duplicates else ""
+                extra += f", {failed} failed" if failed else ""
                 ui.notify(
-                    f"Ingested {ingested} new files, {chunks} chunks added, {skipped} unchanged skipped.",
+                    f"Ingested {ingested} new files, {chunks} chunks added, {skipped} unchanged skipped{extra}.",
                     type="positive",
                 )
                 refresh_knowledge_file_list()
@@ -725,6 +835,19 @@ def main() -> None:
                     with ui.element("div").classes("knowledge-file-name-wrap"):
                         ui.label(filename).classes("knowledge-file-name")
                         ui.tooltip(filename).classes("knowledge-file-tooltip")
+
+    watch_notification_state = {"seen": 0}
+
+    def refresh_knowledge_watch_notifications() -> None:
+        with _kb_watch_lock:
+            messages = list(_kb_watch_notifications)
+        if watch_notification_state["seen"] > len(messages):
+            watch_notification_state["seen"] = 0
+        unseen = messages[watch_notification_state["seen"]:]
+        watch_notification_state["seen"] = len(messages)
+        for message in unseen:
+            ui.notify(message, type="positive" if "failed" not in message.lower() else "negative")
+            refresh_knowledge_file_list()
 
     task_panel: Any | None = None
     productivity_state = {
@@ -866,7 +989,7 @@ def main() -> None:
                     knowledge_upload = ui.upload(
                         on_upload=save_knowledge_file,
                         auto_upload=True,
-                    ).props('accept=".pdf,.txt,.md"').classes("knowledge-upload")
+                    ).props('accept=".pdf,.txt,.md,.docx,.xlsx,.pptx"').classes("knowledge-upload")
                 knowledge_file_list = ui.column().classes("knowledge-file-list")
                 refresh_knowledge_file_list()
                 with ui.row().classes("items-center no-wrap w-full"):
@@ -1158,6 +1281,7 @@ def main() -> None:
 
     async def refresh_live_ui() -> None:
         _show_confirmation(session_id, dialog_holder)
+        refresh_knowledge_watch_notifications()
         render_activity()
         background_result = _take_background_result(session_id)
         if background_result is None:

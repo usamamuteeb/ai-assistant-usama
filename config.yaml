@@ -30,9 +30,35 @@ models:
       - provider: groq
         model: openai/gpt-oss-20b
       - provider: groq
-        model: llama-3.3-70b-versatile
-      - provider: groq
-        model: llama-3.1-8b-instant
+        model: qwen/qwen3.6-27b
+      - provider: openrouter
+        model: nex-agi/nex-n2.5-pro:free
+      - provider: openrouter
+        model: cohere/north-mini-code:free
+      - provider: openrouter
+        model: google/gemma-4-31b-it:free
+      - provider: openrouter
+        model: inclusionai/ling-3.0-flash-vl:free
+      - provider: openrouter
+        model: nex-agi/nex-n2.5-mini:free
+      - provider: openrouter
+        model: inclusionai/ling-3.0-flash-sante:free
+      - provider: openrouter
+        model: inclusionai/ling-3.0-flash-fin:free
+      - provider: openrouter
+        model: dots-studio/dots-3-note-preview:free
+      - provider: openrouter
+        model: liquid/lfm-2.5-2.6b:free
+      - provider: openrouter
+        model: thinkingmachines/inkling:free
+      - provider: openrouter
+        model: thinkingmachines/inkling-small:free
+      - provider: openrouter
+        model: poolside/laguna-s-2.1:free
+      - provider: openrouter
+        model: poolside/laguna-xs-2.1:free
+      - provider: openrouter
+        model: google/gemma-4-26b-a4b-it:free
 
 routing:
   # Heuristic knobs used by ModelRouter.pick_tier() in src/model_router.py
@@ -62,6 +88,9 @@ tool_relevance_filter:
     - list_tasks
     - set_reminder
     - list_reminders
+    # Keep the screen-reader capability available for explicit screen-reading
+    # requests; local keyword ranking alone can hide it behind the tool cap.
+    - read_screen_text
 
 slow_tools:
   # Local Stable Diffusion on CPU can take several minutes. This exception is
@@ -77,7 +106,16 @@ memory:
   max_history_messages: 12            # how many past turns to load; tune this if 12 feels too short
 
 filesystem_tool:
-  workspace_root: workspace           # all file tool I/O is sandboxed here (created if missing)
+  workspace_root: workspace           # relative paths are resolved here
+  # Absolute filesystem access is limited to these user folders plus workspace_root.
+  # New files/folders are additive; replacing or deleting a file asks for approval.
+  allowed_roots:
+    - 'C:\Users\HP\Documents'
+    - 'C:\Users\HP\Downloads'
+    - 'C:\Users\HP\Pictures'
+    - 'C:\Users\HP\Videos'
+    - 'C:\Users\HP\Desktop'
+    - 'C:\Users\HP\Music'
 
 shell_tool:
   require_confirmation: true          # ask before executing shell commands from the CLI
@@ -142,6 +180,7 @@ google_workspace:
   scopes:
     - gmail.readonly
     - gmail.send
+    - gmail.modify
     - calendar
 
 knowledge_base:

@@ -85,30 +85,29 @@ class AnthropicBackend:
         )
 
 
-class GroqBackend:
-    """Free tier via Groq's API (OpenAI-compatible endpoint, no cost, generous
-    rate limits, no local install needed). Use this instead of Ollama when you
-    don't want to run/manage a local model server, and instead of Anthropic
-    when you don't want to spend paid credits.
-
-    Get a free key at https://console.groq.com/keys and put it in .env as
-    GROQ_API_KEY.
-    """
+class OpenAICompatibleBackend:
+    """Backend for providers exposing an OpenAI-compatible chat endpoint."""
 
     supports_tools = True
 
-    def __init__(self, settings: Settings):
-        if not settings.groq_api_key:
-            raise RuntimeError(
-                "GROQ_API_KEY is not set. Add it to .env to use the free_api tier "
-                "(get one free at https://console.groq.com/keys)."
-            )
-        self.api_key = settings.groq_api_key
-        cfg = settings.free_api_model
-        self.max_tokens = cfg.get("max_tokens", 2048)
-        self.base_url = settings.raw.get("models", {}).get("groq", {}).get(
-            "base_url", "https://api.groq.com/openai/v1"
-        )
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str | None,
+        model: str,
+        max_tokens: int = 2048,
+        provider_name: str = "OpenAI-compatible",
+        api_key_name: str = "OPENAI_COMPATIBLE_API_KEY",
+        api_key_url: str | None = None,
+    ):
+        if not api_key:
+            suffix = f" (get one at {api_key_url})" if api_key_url else ""
+            raise RuntimeError(f"{api_key_name} is not set. Add it to .env{suffix}.")
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.max_tokens = max_tokens
+        self.provider_name = provider_name
 
     def chat(
         self,
@@ -172,15 +171,16 @@ class GroqBackend:
         max_backoff_seconds = 4
         deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
-        if not model:
-            raise ValueError("A Groq model is required.")
-        payload["model"] = model
+        selected_model = model or self.model
+        if not selected_model:
+            raise ValueError(f"A {self.provider_name} model is required.")
+        payload["model"] = selected_model
         for attempt in range(max_retries):
             request_timeout = 60.0
             if deadline is not None:
                 request_timeout = deadline - time.monotonic()
                 if request_timeout <= 0:
-                    raise TimeoutError("Groq request exceeded the tool-loop time budget.")
+                    raise TimeoutError(f"{self.provider_name} request exceeded the tool-loop time budget.")
             try:
                 resp = requests.post(
                     f"{self.base_url}/chat/completions",
@@ -189,7 +189,9 @@ class GroqBackend:
                     timeout=min(60.0, request_timeout),
                 )
             except requests.Timeout as exc:
-                raise TimeoutError("Groq request exceeded the tool-loop time budget.") from exc
+                raise TimeoutError(
+                    f"{self.provider_name} request exceeded the tool-loop time budget."
+                ) from exc
 
             if resp.status_code == 429:
                 if attempt < max_retries - 1:
@@ -202,7 +204,9 @@ class GroqBackend:
                     if deadline is not None:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
-                            raise TimeoutError("Groq retry exceeded the tool-loop time budget.")
+                            raise TimeoutError(
+                                f"{self.provider_name} retry exceeded the tool-loop time budget."
+                            )
                         sleep_time = min(sleep_time, remaining)
                     time.sleep(sleep_time)
                 continue
@@ -230,10 +234,36 @@ class GroqBackend:
                 tool_calls=tool_calls,
                 stop_reason=choice.get("finish_reason"),
                 raw=data,
-                model_used=model,
+                model_used=selected_model,
             )
 
-        raise RuntimeError(f"Groq model {model} exhausted after {max_retries} attempts.")
+        raise RuntimeError(
+            f"{self.provider_name} model {selected_model} exhausted after "
+            f"{max_retries} attempts."
+        )
+
+
+class GroqBackend(OpenAICompatibleBackend):
+    """Compatibility wrapper for the historical ``GroqBackend(settings)`` API."""
+
+    def __init__(self, settings: Settings, model: str | None = None):
+        cfg = settings.free_api_model
+        chain = cfg.get("chain", [])
+        configured_model = next(
+            (entry.get("model") for entry in chain if entry.get("provider") == "groq"),
+            None,
+        )
+        super().__init__(
+            base_url=settings.raw.get("models", {}).get("groq", {}).get(
+                "base_url", "https://api.groq.com/openai/v1"
+            ),
+            api_key=settings.groq_api_key,
+            model=model or configured_model or "openai/gpt-oss-120b",
+            max_tokens=cfg.get("max_tokens", 2048),
+            provider_name="Groq",
+            api_key_name="GROQ_API_KEY",
+            api_key_url="https://console.groq.com/keys",
+        )
 
 
 class GeminiBackend:
@@ -442,7 +472,7 @@ class ModelRouter:
         self.settings = settings
         self._premium: AnthropicBackend | None = None
         self._local: OllamaBackend | None = None
-        self._free_api: dict[str, GroqBackend | GeminiBackend] = {}
+        self._free_api: dict[str, OpenAICompatibleBackend | GeminiBackend] = {}
 
     def _get_premium(self) -> AnthropicBackend:
         if self._premium is None:
@@ -454,15 +484,29 @@ class ModelRouter:
             self._local = OllamaBackend(self.settings)
         return self._local
 
-    def _get_free_api(self, provider: str) -> GroqBackend | GeminiBackend:
-        if provider not in self._free_api:
+    def _get_free_api(
+        self, provider: str, model: str | None = None
+    ) -> OpenAICompatibleBackend | GeminiBackend:
+        """Return a backend for one chain entry, cached by provider and model."""
+        cache_key = f"{provider}:{model or ''}"
+        if cache_key not in self._free_api:
             if provider == "groq":
-                self._free_api[provider] = GroqBackend(self.settings)
+                self._free_api[cache_key] = GroqBackend(self.settings, model=model)
             elif provider == "gemini":
-                self._free_api[provider] = GeminiBackend(self.settings)
+                self._free_api[cache_key] = GeminiBackend(self.settings)
+            elif provider == "openrouter":
+                self._free_api[cache_key] = OpenAICompatibleBackend(
+                    base_url="https://openrouter.ai/api/v1",
+                    api_key=self.settings.openrouter_api_key,
+                    model=model or "",
+                    max_tokens=self.settings.free_api_model.get("max_tokens", 2048),
+                    provider_name="OpenRouter",
+                    api_key_name="OPENROUTER_API_KEY",
+                    api_key_url="https://openrouter.ai/keys",
+                )
             else:
                 raise ValueError(f"Unsupported free_api provider: {provider}")
-        return self._free_api[provider]
+        return self._free_api[cache_key]
 
     def pick_tier(self, latest_user_message: str) -> str:
         routing = self.settings.routing
@@ -489,7 +533,7 @@ class ModelRouter:
             chain = self.settings.free_api_model.get("chain", [])
             if not chain:
                 raise RuntimeError("Free API model chain is empty. Add models.free_api.chain to config.yaml.")
-            return self._get_free_api(chain[0]["provider"])
+            return self._get_free_api(chain[0]["provider"], chain[0]["model"])
         raise ValueError(f"Unknown tier: {tier}")
 
     def chat(
@@ -515,7 +559,7 @@ class ModelRouter:
                 model = entry["model"]
                 tried.append(f"{provider}:{model}")
                 try:
-                    backend = self._get_free_api(provider)
+                    backend = self._get_free_api(provider, model)
                     result = backend.chat(
                         messages,
                         tools=tools,
@@ -528,7 +572,7 @@ class ModelRouter:
                 except TimeoutError:
                     raise
                 except RuntimeError as exc:
-                    if "GEMINI_API_KEY" in str(exc):
+                    if "API_KEY is not set" in str(exc):
                         raise
                     if index < len(chain) - 1:
                         next_entry = chain[index + 1]

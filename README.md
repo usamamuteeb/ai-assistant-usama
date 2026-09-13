@@ -13,8 +13,8 @@ it into whatever shape your use cases need. You can still run Goose/n8n alongsid
   with a simple heuristic to pick one automatically (or you can force it).
 - **Tool-use loop** (ReAct-style): the model can call tools, see results, call more tools, then answer —
   using Anthropic's native tool-use format.
-- **Three real tools**: filesystem (read/write/list, sandboxed to a workspace folder), shell command
-  execution (with a safety confirmation switch), and a memory-search tool.
+- **Three real tools**: filesystem (read/write/list across the configured workspace and user folders),
+  shell command execution (with a safety confirmation switch), and a memory-search tool.
 - **Clipboard tools**: read and write the system clipboard through the local clipboard plugin.
 - **Memory**: SQLite for structured state + conversation log, Chroma (local vector DB) for semantic
   long-term memory. Both are real, working stores, not stubs.
@@ -43,6 +43,29 @@ playwright install chromium
 # install Ollama from https://ollama.com, then:
 ollama pull llama3.1
 ```
+
+## OpenRouter fallback setup
+
+The free API chain keeps OpenRouter as its final fallback, after Gemini and all
+configured Groq models. Add `OPENROUTER_API_KEY` to `.env`; OpenRouter offers
+free keys without a card at [openrouter.ai/keys](https://openrouter.ai/keys).
+The configured `qwen/qwen3-coder:free` ID should be checked against the live
+[OpenRouter model catalog](https://openrouter.ai/models) before relying on it,
+because free models can rotate or become temporarily unavailable without
+notice. This provider is intentionally last rather than competing for normal
+traffic: its free models have independent provider-side rate limits and other
+reliability issues beyond this account's quota.
+
+The current fallback snapshot includes tool-capable free models from Nex-AGI,
+Cohere, Google, InclusionAI, Dots, Liquid, Thinking Machines, and Poolside.
+Because this list is maintained by OpenRouter and can change, treat any stale
+entry as disposable: the router falls through to the next configured model.
+
+NVIDIA NIM, Cerebras, and Mistral were evaluated and intentionally excluded:
+NVIDIA NIM had only a one-time credit signal; Cerebras had conflicting trial
+reports; and Mistral had conflicting trial reports plus phone verification.
+They should not be added to the fallback chain without revisiting those
+constraints.
 
 Run the chat loop:
 
@@ -111,6 +134,30 @@ is running. You can later install another compatible checkpoint in
 The local ComfyUI backend uses only stock ComfyUI nodes (checkpoint loader, text encoders,
 KSampler, VAE decode, and Save Image); no custom workflow or cloud account is required.
 
+## Personal knowledge base
+
+The knowledge base indexes `.pdf`, `.txt`, `.md`, `.docx`, `.xlsx`, and `.pptx`
+files from the configured workspace folder. PDFs are chunked per page so the
+citation search can report `filename, page N`; spreadsheet sheets and
+presentation slides are retained as metadata. Existing chunks created before
+page-aware ingestion do not have page numbers, so re-index existing documents
+if page citations and content-hash duplicate detection are needed.
+
+Available tools include `ingest_knowledge_base`, `search_knowledge_base`,
+`search_knowledge_base_with_citations`, `list_knowledge_documents`,
+`document_summary`, `ask_document`, `tag_document`, and
+`remove_knowledge_document`. Searches support filename substring, category,
+and ingestion-date filters. Removing a document only unindexes it by default;
+deleting the source file requires the normal approval prompt.
+
+When the NiceGUI web UI is running, a watchdog observes the configured
+knowledge-base folder and automatically re-indexes changed documents after a
+short debounce, with a toast showing the result. This watcher is deliberately
+web-UI-only: the CLI and scheduler do not run a background observer and still
+require an explicit `ingest_knowledge_base` call. The sidebar upload accepts all
+six supported document types; direct file copies into the folder are picked up
+by the web watcher too.
+
 ## Screen reading (OCR) setup
 
 Screen reading uses Tesseract OCR to capture and read visible text. Download and
@@ -127,9 +174,11 @@ not a specific app — the extracted text is sent to whichever model answers thi
 ## Windows desktop control setup
 
 On Windows, the `windows_control` plugin can inspect visible windows and read their
-controls. It can also open applications, click controls, close windows, and type
-on your actual desktop. Those action tools are powerful: a click or keystroke can
-affect whatever is open on the machine.
+controls. It can also open applications, wait for them to become ready, focus or
+move/resize windows, click controls by visible text or automation ID, close windows,
+and type into a verified target on your actual desktop. `read_active_window` reports
+the current foreground window and its visible controls. Those action tools are
+powerful: a click or keystroke can affect whatever is open on the machine.
 
 `config.yaml` sets `windows_control.force_manual_confirmation: true` by default.
 It keeps two high-risk actions behind a real approval prompt even when the global
@@ -139,8 +188,10 @@ focused window. `open_application` and `click_window_control` follow the global
 approval mode normally. Keep the override enabled unless you have a carefully
 controlled environment.
 
-The `send_keystrokes_fallback` tool uses PyAutoGUI only as a fallback and targets
-whichever window is currently focused. PyAutoGUI's failsafe remains enabled:
+`type_into_window` first matches and focuses the requested window, then sends text
+through that verified pywinauto target. In contrast, `send_keystrokes_fallback` uses
+PyAutoGUI as a blunt fallback and targets whichever window is currently focused;
+it is intentionally the higher-risk option. PyAutoGUI's failsafe remains enabled:
 drag the mouse pointer to any screen corner to abort an in-progress fallback
 action immediately.
 
@@ -252,8 +303,10 @@ which tier was used, so you can see if the heuristic is routing sensibly before 
 - `shell_tool.require_confirmation`: if true (default), shell commands print what they'd run and require
   the CLI user to confirm before execution. Turn this off only for the scheduler running fully unattended
   tasks you already trust.
-- `filesystem_tool.workspace_root`: all file tool operations are sandboxed under this path. The tool
-  refuses to touch anything outside it.
+- `filesystem_tool.workspace_root`: relative filesystem paths resolve under this workspace. Absolute
+  paths are also allowed only under the configured `filesystem_tool.allowed_roots` folders (Documents,
+  Downloads, Pictures, Videos, Desktop, and Music by default). Reads/lists and new writes are allowed;
+  replacing or deleting a file requires confirmation.
 
 ## Google Workspace setup
 
@@ -328,6 +381,24 @@ You do not need to edit `cli.py` for this. The model can decide to use these too
 - `Search my inbox for invoices from this month.`
 - `Create a calendar event for tomorrow at 3pm for a project review.`
 - `Send an email to alice@example.com with the subject 'Project update' and a short summary body.`
+
+### Google Workspace tools
+
+In addition to search, send, list-events, and create-event, the plugin provides:
+
+- Gmail: `gmail_get_message`, `gmail_reply`, `gmail_forward`,
+  `gmail_archive_message`, and `gmail_download_attachment`.
+- Calendar: `calendar_find_free_time`, `calendar_update_event`,
+  `calendar_delete_event`, and `calendar_create_recurring_event`.
+- Local productivity: `email_to_task` and `get_daily_agenda`.
+
+Replies preserve the original Gmail thread. Forwarding quotes the original
+message and accepts an optional note, but original attachments are intentionally
+not automatically re-attached. Attachment downloads never overwrite an
+existing file; they use a numbered filename instead. Archive/update/delete and
+all message/event creation actions use the normal global confirmation mode.
+Because archiving requires the Gmail modify scope, an existing OAuth token may
+need to be authorized again after adding `gmail.modify` to `config.yaml`.
 
 ## Browser automation setup
 
