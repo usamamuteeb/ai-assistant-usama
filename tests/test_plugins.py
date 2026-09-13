@@ -14,6 +14,7 @@ PLUGIN_NAMES = [
     "browser",
     "clipboard",
     "dev_tools",
+    "file_automation",
     "google_workspace",
     "image_generation",
     "screen_reader",

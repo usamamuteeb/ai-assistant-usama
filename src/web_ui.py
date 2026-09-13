@@ -595,6 +595,15 @@ def main() -> None:
         .knowledge-file-name { display: block; max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .knowledge-file-tooltip { max-width: 260px; white-space: normal; overflow-wrap: anywhere; }
         .knowledge-reindex { width: 100%; margin-top: .7rem; }
+        .productivity-card { gap: .55rem; }
+        .productivity-copy { color: var(--muted); font-size: .7rem; line-height: 1.4; }
+        .productivity-list { width: 100%; gap: .3rem; max-height: 10rem; overflow-y: auto; }
+        .productivity-item { width: 100%; min-width: 0; padding: .38rem .45rem; border-radius: 6px; background: rgba(255,255,255,.045); }
+        .productivity-item-icon { color: #d96a72; font-size: .85rem; }
+        .productivity-item-delivered { color: #65d993; }
+        .productivity-item-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d9dde4; font-size: .72rem; }
+        .productivity-item-meta { color: #8e96a2; font-size: .62rem; white-space: nowrap; }
+        .productivity-empty { color: #8e96a2; font-size: .68rem; }
         .compose-helper { padding-left: 2rem; }
         .activity-header { width: 100%; padding: .35rem 0 .9rem; border-bottom: 1px solid var(--line); }
         .activity-title { color: #fff; font-size: .93rem; font-weight: 750; }
@@ -717,6 +726,106 @@ def main() -> None:
                         ui.label(filename).classes("knowledge-file-name")
                         ui.tooltip(filename).classes("knowledge-file-tooltip")
 
+    task_panel: Any | None = None
+    productivity_state = {
+        "signature": "",
+        "initialized": False,
+        "notified_delivered_ids": set(),
+        "session_started_at": time.time(),
+    }
+
+    def _local_time(timestamp: Any) -> str:
+        try:
+            return time.strftime("%b %d, %H:%M", time.localtime(float(timestamp)))
+        except (TypeError, ValueError, OverflowError):
+            return ""
+
+    def refresh_productivity_panel() -> None:
+        if task_panel is None:
+            return
+        try:
+            # Claiming is atomic, so this works when the scheduler is not
+            # running. If the scheduler wins the race, the delivered row is
+            # still read below and surfaced in this browser session.
+            claimed_reminders = orchestrator.store.claim_due_reminders()
+            claimed_ids = {int(reminder["id"]) for reminder in claimed_reminders}
+            delivered = orchestrator.store.list_reminders(status="delivered")
+            delivered_ids = {int(reminder["id"]) for reminder in delivered}
+            notified_ids = productivity_state["notified_delivered_ids"]
+            session_started_at = productivity_state["session_started_at"]
+
+            for reminder in delivered:
+                reminder_id = int(reminder["id"])
+                updated_at = reminder.get("updated_at")
+                is_new_for_session = (
+                    reminder_id in claimed_ids
+                    or (
+                        isinstance(updated_at, (int, float))
+                        and float(updated_at) >= session_started_at
+                    )
+                )
+                if reminder_id not in notified_ids and is_new_for_session:
+                    ui.notify(
+                        f"Reminder: {reminder['message']}",
+                        type="warning",
+                        position="top",
+                        timeout=20000,
+                    )
+                    notified_ids.add(reminder_id)
+
+            # Existing delivered reminders are useful history, but should not
+            # produce a burst of notifications just because the page opened.
+            if not productivity_state["initialized"]:
+                notified_ids.update(
+                    reminder_id
+                    for reminder_id in delivered_ids
+                    if reminder_id not in claimed_ids
+                    and reminder_id not in notified_ids
+                )
+                productivity_state["initialized"] = True
+
+            tasks = orchestrator.store.list_tasks(status="open")[:5]
+            reminders = orchestrator.store.list_reminders(status="upcoming")[:5]
+            recent_delivered = delivered[-5:]
+            signature = repr((tasks, reminders, recent_delivered))
+            if signature == productivity_state["signature"] and not claimed_reminders:
+                return
+            productivity_state["signature"] = signature
+            task_panel.clear()
+            with task_panel:
+                ui.label("Tasks & Reminders").classes("sidebar-card-title")
+                ui.label("Ask the assistant to create, update, or remind you.").classes("productivity-copy")
+                ui.label("OPEN TASKS").classes("sidebar-subsection-label")
+                with ui.column().classes("productivity-list"):
+                    if not tasks:
+                        ui.label("No open tasks.").classes("productivity-empty")
+                    for task in tasks:
+                        with ui.row().classes("productivity-item items-center no-wrap"):
+                            ui.icon("check_box_outline_blank").classes("productivity-item-icon")
+                            ui.label(str(task.get("title") or task.get("description", ""))).classes("productivity-item-title")
+                            if task.get("due_at"):
+                                ui.label(_local_time(task["due_at"])).classes("productivity-item-meta")
+                ui.label("UPCOMING REMINDERS").classes("sidebar-subsection-label")
+                with ui.column().classes("productivity-list"):
+                    if not reminders:
+                        ui.label("No upcoming reminders.").classes("productivity-empty")
+                    for reminder in reminders:
+                        with ui.row().classes("productivity-item items-center no-wrap"):
+                            ui.icon("notifications_none").classes("productivity-item-icon")
+                            ui.label(str(reminder.get("message", ""))).classes("productivity-item-title")
+                            ui.label(_local_time(reminder.get("remind_at"))).classes("productivity-item-meta")
+                ui.label("RECENTLY DELIVERED").classes("sidebar-subsection-label")
+                with ui.column().classes("productivity-list"):
+                    if not recent_delivered:
+                        ui.label("No reminders delivered yet.").classes("productivity-empty")
+                    for reminder in reversed(recent_delivered):
+                        with ui.row().classes("productivity-item items-center no-wrap"):
+                            ui.icon("check_circle").classes("productivity-item-icon productivity-item-delivered")
+                            ui.label(str(reminder.get("message", ""))).classes("productivity-item-title")
+                            ui.label(_local_time(reminder.get("remind_at"))).classes("productivity-item-meta")
+        except Exception as exc:
+            logger.warning("Could not refresh tasks and reminders: %s", exc)
+
     left_sidebar = ui.left_drawer(value=bool(client["left_sidebar_visible"])).props("behavior=desktop width=300").classes("p-5 assistant-sidebar")
     with left_sidebar:
         with ui.row().classes("assistant-brand items-center no-wrap"):
@@ -769,6 +878,9 @@ def main() -> None:
                     ).classes("knowledge-reindex")
                     reindex_spinner = ui.spinner("dots", size="sm", color="primary")
                     reindex_spinner.set_visibility(False)
+
+            task_panel = ui.column().classes("sidebar-card productivity-card")
+            refresh_productivity_panel()
 
     activity_render_state = {"signature": ""}
 
@@ -1017,6 +1129,9 @@ def main() -> None:
             "images": orchestrator.get_last_images(session_id),
         })
         _render_history(chat_log, history)
+        # A reminder can be created by the assistant during this turn. Refresh
+        # immediately so it is visible without waiting for the periodic poll.
+        refresh_productivity_panel()
         if client["read_replies_aloud"] and not reply.startswith("[error]"):
             await run.io_bound(speak_text, reply)
         await ui.run_javascript(
@@ -1094,6 +1209,9 @@ def main() -> None:
                     f"{len(background_result['images'])} image file(s) are available in the chat.",
                 )
         _render_history(chat_log, history)
+        # The completed background turn may have created a reminder; update
+        # the sidebar as soon as its final result arrives.
+        refresh_productivity_panel()
         if client["read_replies_aloud"] and not completed_reply.startswith("[error]"):
             await run.io_bound(speak_text, completed_reply)
         await ui.run_javascript(
@@ -1103,6 +1221,7 @@ def main() -> None:
 
     ui.timer(0.3, refresh_live_ui)
     ui.timer(2.0, refresh_image_setup)
+    ui.timer(10.0, refresh_productivity_panel)
 
 
 if __name__ in {"__main__", "__mp_main__"}:

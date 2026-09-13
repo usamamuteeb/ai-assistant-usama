@@ -58,6 +58,10 @@ tool_relevance_filter:
     - search_memory
     - search_knowledge_base
     - generate_image
+    - create_task
+    - list_tasks
+    - set_reminder
+    - list_reminders
 
 slow_tools:
   # Local Stable Diffusion on CPU can take several minutes. This exception is
@@ -126,6 +130,13 @@ dev_tools:
     - 'C:\Program Files (x86)'
     - 'C:\Users\HP\AppData'
 
+file_automation:
+  # File automation can access any absolute path on C:, including Desktop,
+  # Downloads, Documents, Pictures, Videos, and Music. Protected prefixes
+  # above are still refused before confirmation or dry-run handling.
+  force_manual_confirmation: true
+  backup_folder: file_backups       # relative to the configured workspace root
+
 google_workspace:
   credentials_path: credentials.json   # downloaded from Google Cloud Console project root
   scopes:
@@ -138,6 +149,10 @@ knowledge_base:
   chroma_collection: assistant_knowledge_base
   chunk_size: 1400
   chunk_overlap: 180
+
+task_manager:
+  # The scheduler checks durable one-time reminders at this interval.
+  reminder_poll_seconds: 15
 
 scheduled_tasks:
   - name: daily_briefing

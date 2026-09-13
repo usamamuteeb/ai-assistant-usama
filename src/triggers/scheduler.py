@@ -17,9 +17,12 @@ import uuid
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from ..config import load_settings
+from ..memory.store import SqliteStore
 from ..orchestrator import Orchestrator
+from plugins.task_manager.plugin import deliver_due_reminders
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("scheduler")
@@ -43,9 +46,18 @@ def run_task(orchestrator: Orchestrator, name: str, prompt: str, tier: str | Non
         log.exception("Task '%s' failed", name)
 
 
+def run_due_reminders(store: SqliteStore) -> None:
+    """Deliver reminders without invoking the model or consuming API tokens."""
+    try:
+        deliver_due_reminders(store, logger=log)
+    except Exception:
+        log.exception("Reminder dispatch failed")
+
+
 def main() -> None:
     settings = load_settings()
     orchestrator = Orchestrator(settings, confirm_fn=unattended_confirm)
+    reminder_store = SqliteStore(settings.sqlite_path())
 
     scheduler = BlockingScheduler()
     tasks = settings.scheduled_tasks
@@ -64,6 +76,23 @@ def main() -> None:
             id=task["name"],
         )
         log.info("Scheduled '%s' with cron '%s'", task["name"], task["cron"])
+
+    task_config = settings.raw.get("task_manager", {})
+    poll_seconds = 15
+    if isinstance(task_config, dict):
+        try:
+            poll_seconds = max(5, int(task_config.get("reminder_poll_seconds", 15)))
+        except (TypeError, ValueError):
+            pass
+    scheduler.add_job(
+        run_due_reminders,
+        IntervalTrigger(seconds=poll_seconds),
+        args=[reminder_store],
+        id="reminder_dispatch",
+        coalesce=True,
+        max_instances=1,
+    )
+    log.info("Reminder dispatcher polling every %ss", poll_seconds)
 
     log.info("Scheduler running. Press Ctrl+C to stop.")
     scheduler.start()

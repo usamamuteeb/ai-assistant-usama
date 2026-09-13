@@ -176,6 +176,28 @@ Run the scheduler (executes tasks defined in `config.yaml` under `scheduled_task
 python -m src.triggers.scheduler
 ```
 
+## Tasks and one-time reminders
+
+The `task_manager` plugin provides durable personal tasks and reminders in the same
+SQLite database used by the assistant. You can ask the assistant to create, list,
+update, complete, or delete tasks, and to set, list, cancel, or snooze one-time
+reminders. Task deletion requires confirmation.
+
+Examples:
+
+- `Create a high-priority task called Prepare the project demo due 2026-09-20T09:00.`
+- `Show my overdue tasks.`
+- `Remind me in 30 minutes to check the deployment.`
+- `Snooze reminder 4 for 20 minutes.`
+
+Reminder times accept ISO date/time values, `tomorrow at 9:00 AM`, `today at 17:30`,
+and relative values such as `in 10 seconds`, `in 10 sec`, `after 5 minutes`, or
+`in 1 hour and 30 minutes`. Reminders are stored durably and are
+delivered by the scheduler's reminder dispatcher. Start `python -m src.triggers.scheduler`
+to receive terminal/log delivery while the scheduler is running; the NiceGUI app also
+shows open tasks, upcoming reminders, and browser notifications while it is open.
+The polling interval is configurable with `task_manager.reminder_poll_seconds`.
+
 ## Project layout
 
 ```
@@ -324,3 +346,19 @@ Browser actions are visible on the desktop by default (`browser.headless: false`
 ## Optional system automation
 
 This project can also opt into an optional `plugins/system_monitor/plugin.py` toolset for local system health and process inspection. It exposes `system_stats`, `list_processes`, and `kill_process` tools. The destructive `kill_process` tool is gated behind the same explicit confirm callback pattern as the shell tool, so it will not terminate anything without user approval.
+
+## File and document automation
+
+The `file_automation` plugin can rename, move, copy, and organize files anywhere
+on the C: drive, including Desktop, Downloads, Documents, Pictures, Videos, and
+Music. It can also create Markdown, PDF, and Word reports, extract PDF tables,
+and convert documents. Paths must be absolute. The protected prefixes from
+`dev_tools.protected_path_prefixes` are always refused.
+
+Install [Pandoc](https://pandoc.org/installing.html) separately for
+`convert_document`; it is free and must be available on PATH. Every overwrite
+performed by this plugin first creates a timestamped copy under
+`workspace/file_backups/`. Pass `dry_run: true` to a destructive file action to
+validate it and preview the exact operation without changing the filesystem.
+When `file_automation.force_manual_confirmation` is enabled, rename/move and
+overwrite actions that can replace existing files require real manual approval.
